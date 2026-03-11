@@ -1,0 +1,435 @@
+import os
+import sys
+from copy import deepcopy
+
+_file_dir = os.path.dirname(os.path.abspath(__file__))   # eval/long_recon/
+root_dir  = os.path.dirname(os.path.dirname(_file_dir))  # project root
+sys.path.insert(0, root_dir)
+src_dir = os.path.join(root_dir, 'src')
+sys.path.insert(0, src_dir)
+
+from datetime import datetime
+import torch
+import argparse
+import numpy as np
+import os.path as osp
+import logging
+import json
+
+from torch.utils.data._utils.collate import default_collate
+from tqdm import tqdm
+
+from causalvggt.utils.geometry import unproject_depth_map_to_point_map, inv
+from causalvggt.utils.pose_enc import pose_encoding_to_extri_intri
+from causalvggt.utils.helper import ImgNorm2Unit as ImgDust3r2Stream3r
+
+from model_wrapper import load_model, run_model
+from eval.long_recon.data import SevenScenes, NRGBD, DTU
+from eval.long_recon.eval_utils import eval_scene
+
+import json
+
+torch.backends.cuda.matmul.allow_tf32 = True
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+torch.set_num_threads(1)
+
+logger = logging.getLogger("EvalLogger")
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+    datefmt="%H:%M:%S",
+)
+
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+
+
+def get_args_parser():
+    parser = argparse.ArgumentParser("Reconstruction Evaluation", add_help=False)
+
+    # model
+    parser.add_argument("--model_name", type=str, default="causalvggt")
+    parser.add_argument("--base_model", type=str, default="stream3r",
+                        choices=["vggt", "stream3r", "streamvggt"],
+                        help="Base model for CausalVGGT")
+
+    # output
+    parser.add_argument("--output_dir", type=str, default="eval_results/recon")
+    parser.add_argument("--save_tag", "--tag", type=str, default=None)
+    parser.add_argument("--vis_tag", type=str, default=None)
+
+    # dataset
+    parser.add_argument("--dataset_type", type=str, required=True,
+                        choices=["7scenes", "NRGBD", "DTU"],
+                        help="Dataset type to evaluate")
+    parser.add_argument("--scene_name", nargs="*", default=[],
+                        help="Specific scene(s) to evaluate (default: all)")
+    parser.add_argument("--size", type=int, default=512)
+    parser.add_argument("--kf_every", type=int, default=1,
+                        help="Keyframe interval")
+    parser.add_argument("--num_frames", type=int, default=-1,
+                        help="Number of frames to use (-1 for all, NRGBD only)")
+    parser.add_argument("--start_frame", type=int, default=0,
+                        help="Starting frame index (NRGBD only)")
+
+    # inference mode
+    parser.add_argument("--mode", type=str, default="full",
+                        help="Processing mode")
+    parser.add_argument("--streaming", action="store_true",
+                        help="Use streaming mode")
+    parser.add_argument("--max_kv_size", type=int, default=-1,
+                        help="Max KV cache frames (-1 for all)")
+
+    # KV cache
+    parser.add_argument("--window_size", "-win", type=int, default=0)
+    parser.add_argument("--chunk_size", "-ck", type=int, default=1)
+    parser.add_argument("--hh_size", "-hh", type=int, default=0)
+    parser.add_argument("--retrieval_size", "-ret_sz", type=int, default=0)
+    parser.add_argument("--retrieve_buf", "-ret_buf", action="store_true")
+    parser.add_argument("--temperature", type=float, default=0.9)
+    parser.add_argument("--kvcache_patch", type=int, default=1)
+    parser.add_argument("--pinned", type=int, default=[0], nargs="+")
+
+    # voxel
+    parser.add_argument("--voxel_size", type=float, default=0.05)
+    parser.add_argument("--voxel_num", type=int, default=4096)
+    parser.add_argument("--voxel_conf", type=float, default=None,
+                        help="Confidence threshold filter for voxel merging. ")
+    parser.add_argument("--voxel_buf_cap", type=int, default=8)
+    parser.add_argument("--voxel_piv_cap", type=int, default=4)
+    parser.add_argument("--voxel_backend", type=str, default="python",
+                        choices=["cuda", "python"])
+    parser.add_argument("--allocator", "-alloc", type=str, default="slab",
+                        choices=["static", "slab", "segment"])
+
+    # misc
+    parser.add_argument("--ablate", nargs="*", default=[])
+
+    #eval
+    parser.add_argument("--eval_cpu", action="store_true",
+                        help="Evaluate on CPU (default: CUDA)")
+    return parser
+
+
+def find_scene_index(dataset, scene_name):
+    scene_ids = []
+    if hasattr(dataset, 'scene_list'):
+        for name in scene_name:
+            try:
+                scene_ids.append(dataset.scene_list.index(name))
+            except ValueError:
+                logger.error(f"Scene '{name}' not found. Available: {dataset.scene_list}")
+                return None
+    else:
+        logger.error("Dataset doesn't have scene_list attribute")
+        return None
+    return scene_ids
+
+
+def run(images, model, dtype, device, args):
+    frame_num = images.shape[0]
+    logger.info(f"Input images shape: {images.shape}")
+
+    model_kwargs = {
+        "tag": args.vis_tag,
+        "cam_cache_update": False,
+        "max_frames": args.max_kv_size if args.max_kv_size > 0 else frame_num + 1,
+        "window_size": args.window_size,
+        "hh_size": args.hh_size,
+        "retrieval_size": args.retrieval_size,
+        "return_buf": args.retrieve_buf,
+        "temperature": args.temperature,
+        "voxel_size": args.voxel_size,
+        "voxel_num": args.voxel_num,
+        "conf_threshold": args.voxel_conf,
+        "voxel_buf_cap": args.voxel_buf_cap,
+        "voxel_piv_cap": args.voxel_piv_cap,
+        "voxel_backend": args.voxel_backend,
+        "chunk_size": args.chunk_size,
+        "allocator": args.allocator,
+        "kvcache_patch_size": args.kvcache_patch,
+        "pinned_frame_indices": args.pinned,
+        "ablate": args.ablate,
+    }
+
+    with torch.no_grad():
+        with torch.amp.autocast(device_type="cuda", dtype=dtype):
+            predictions = run_model(model, images,
+                                    args.model_name,
+                                    streaming=args.streaming,
+                                    mode=args.mode,
+                                    dtype=dtype,
+                                    device=device,
+                                    **model_kwargs)
+            args.mode = predictions.get("mode", args.mode)
+            args.streaming = predictions.get("streaming", args.streaming)
+            predictions.pop("mode", None)
+            predictions.pop("streaming", None)
+
+    logger.info(f"Model: {args.model_name}, Mode: {args.mode}, Streaming: {args.streaming}")
+
+    extrinsic, intrinsic = pose_encoding_to_extri_intri(
+        predictions["pose_enc"], predictions["images"].shape[-2:]
+    )
+    predictions["extrinsic"] = extrinsic
+    predictions["intrinsic"] = intrinsic
+
+    for key in predictions.keys():
+        if isinstance(predictions[key], torch.Tensor):
+            predictions[key] = predictions[key].cpu().numpy().squeeze(0)
+    predictions['pose_enc_list'] = None
+
+    depth_map = predictions["depth"]
+    predictions["world_points_from_depth"] = unproject_depth_map_to_point_map(
+        depth_map, predictions["extrinsic"], predictions["intrinsic"]
+    )
+
+    model_stats = {
+        "name": args.model_name,
+        "base_model": args.base_model,
+        "mode": args.mode,
+        "streaming": args.streaming,
+        "ablate": args.ablate,
+    }
+    if "window" in args.mode:
+        model_stats["window_size"] = args.window_size
+        if args.streaming:
+            model_stats["hh_size"] = args.hh_size
+            model_stats["retrieval_size"] = args.retrieval_size
+            model_stats["kvcache_patch_size"] = args.kvcache_patch
+            model_stats["chunk_size"] = args.chunk_size
+            model_stats["pinned_frame_indices"] = args.pinned
+            model_stats["temperature"] = args.temperature
+            model_stats["voxel_size"] = args.voxel_size
+            model_stats["voxel_num"] = args.voxel_num
+            model_stats["conf_threshold"] = args.voxel_conf
+            if "merge" in args.mode:
+                model_stats["allocator"] = args.allocator
+                model_stats["return_buf"] = args.retrieve_buf
+                model_stats["voxel_buf_cap"] = args.voxel_buf_cap
+                model_stats["voxel_piv_cap"] = args.voxel_piv_cap
+                model_stats["voxel_backend"] = args.voxel_backend
+
+    torch.cuda.empty_cache()
+    return predictions, {"model": model_stats}
+
+def main(args):
+    if args.size == 518:
+        resolution = (518, 336)
+    elif args.size == 512:
+        resolution = (512, 384)
+    elif args.size == 224:
+        resolution = (224, 224)
+    else:
+        raise NotImplementedError(f"Unsupported size: {args.size}")
+
+    if args.dataset_type == "7scenes":
+        dataset = SevenScenes(
+            split="test", ROOT='./data/7scenes',
+            resolution=resolution, num_seq=1,
+            full_video=True, kf_every=args.kf_every,
+        )
+        args.voxel_conf = 2.0 if args.voxel_conf is None else args.voxel_conf
+    elif args.dataset_type == "NRGBD":
+        dataset = NRGBD(
+            split="test", ROOT='./data/neural_rgbd',
+            resolution=resolution,
+            start_frame=args.start_frame,
+            num_frames=args.num_frames,
+            num_seq=1, full_video=True, kf_every=args.kf_every,
+        )
+        args.voxel_conf = 4.0 if args.voxel_conf is None else args.voxel_conf
+    elif args.dataset_type == "DTU":
+        dataset = DTU(
+            split="test", ROOT='./data/DTU',
+            resolution=resolution, num_seq=1,
+            full_video=True, kf_every=1,
+        )
+        args.voxel_conf = 2.0 if args.voxel_conf is None else args.voxel_conf
+    else:
+        raise ValueError(f"Unknown dataset type: {args.dataset_type}")
+
+    logger.info(f"Dataset {args.dataset_type} loaded with {len(dataset.scene_list)} scenes")
+    logger.info(f"Available scenes: {dataset.scene_list}")
+
+    if args.scene_name == []:
+        data_idx = range(len(dataset))
+    else:
+        data_idx = find_scene_index(dataset, args.scene_name)
+        if data_idx is None:
+            return
+        logger.info(f"Found scene(s) {args.scene_name} at index {data_idx}")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    assert device == "cuda", "Evaluation currently only supports CUDA device"
+    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+
+    model = load_model(args.model_name, args.base_model, device)
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    all_metrics = {}
+    for name_idx in tqdm(data_idx, desc="Evaluating scenes"):
+        try:
+            basic_metrics = {}
+            scene_name = dataset.scene_list[name_idx]
+            save_scene_name = f"{scene_name}/{args.save_tag}" if args.save_tag else scene_name
+            save_dir = osp.join(args.output_dir, args.dataset_type, args.model_name, save_scene_name)
+            os.makedirs(save_dir, exist_ok=True)
+
+            timedelta = datetime.now().strftime("%Y-%m-%d-%H-%M")
+            vis_tag = args.vis_tag if args.vis_tag is not None else timedelta
+
+            logger.info(f"Evaluating scene '{scene_name}' [{args.dataset_type}]")
+            basic_metrics["clock"]   = timedelta
+            basic_metrics["dataset"] = args.dataset_type
+            basic_metrics["scene"]   = scene_name
+            basic_metrics["kf_every"] = args.kf_every
+
+            batch = default_collate([dataset[name_idx]])
+
+            ignore_keys = {"dataset", "label", "depthmap", "instance", "idx", "true_shape", "rng"}
+            for view in batch:
+                for name in view.keys():
+                    if name in ignore_keys:
+                        continue
+                    if isinstance(view[name], (tuple, list)):
+                        view[name] = [x.to(device, non_blocking=True) for x in view[name]]
+                    else:
+                        view[name] = view[name].to(device, non_blocking=True)
+
+            images = torch.cat([item['img'] for item in batch])
+            images = ImgDust3r2Stream3r(images).to(device)
+
+            basic_metrics["num_frames"] = images.shape[0]
+            predictions, model_metrics = run(images, model, dtype, device, args)
+            basic_metrics.update(model_metrics)
+
+            # Reconstruction evaluation (GPU pointmap from depth)
+            logger.info("📌 Evaluating Reconstruction")
+            metrics_data = eval_scene(batch, predictions, args.dataset_type,
+                                      save_dir=save_dir, revisit=1, use_gpu=not args.eval_cpu)
+            basic_metrics["reconstruction"] = metrics_data
+
+            # Save per-scene metrics
+            metrics_dir = osp.join(save_dir, "metrics")
+            os.makedirs(metrics_dir, exist_ok=True)
+            metrics_file = osp.join(metrics_dir, f"metrics_{vis_tag}.json")
+            if os.path.exists(metrics_file):
+                import random, string
+                rand_hash = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
+                metrics_file = metrics_file.replace(".json", f"_{rand_hash}.json")
+            with open(metrics_file, "w") as f:
+                json.dump(basic_metrics, f, indent=2)
+            logger.info(f"📌 Saved metrics to {metrics_file}")
+
+            all_metrics[scene_name] = basic_metrics
+
+        except Exception as e:
+            timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
+            os.makedirs("./logs/error", exist_ok=True)
+            with open(f"./logs/error/log_{timestamp}.txt", "a") as f:
+                f.write(f"Exception in scene {scene_name}: {str(e)}\n")
+            if "out of memory" in str(e):
+                torch.cuda.empty_cache()
+                logger.warning(f"OOM in scene {scene_name}, skipping.")
+            else:
+                raise e
+
+        torch.cuda.empty_cache()
+
+    # Print summary table
+    # display columns and their source keys in metrics_data
+    col_keys = [
+        ("Acc_mean",  "accuracy"),
+        ("Comp_mean", "completion"),
+        ("NC_mean",   None),           # derived: (nc1 + nc2) / 2
+        ("Acc_med",   "accuracy_median"),
+        ("Comp_med",  "completion_median"),
+        ("NC_med",    None),           # derived: (nc1_med + nc2_med) / 2
+    ]
+    display_cols = [c for c, _ in col_keys]
+
+    def _get_row_vals(recon):
+        row = {}
+        for col, key in col_keys:
+            if key is not None:
+                row[col] = recon.get(key)
+            elif col == "NC_mean":
+                nc1 = recon.get("normal_consistency_1")
+                nc2 = recon.get("normal_consistency_2")
+                row[col] = (nc1 + nc2) / 2 if (nc1 is not None and nc2 is not None) else None
+            elif col == "NC_med":
+                nc1 = recon.get("normal_consistency_1_median")
+                nc2 = recon.get("normal_consistency_2_median")
+                row[col] = (nc1 + nc2) / 2 if (nc1 is not None and nc2 is not None) else None
+        return row
+
+    accum = {c: [] for c in display_cols}
+    scene_rows = []
+    for scene, info in all_metrics.items():
+        recon = info.get("reconstruction", {})
+        row = {"scene": scene, **_get_row_vals(recon)}
+        for c in display_cols:
+            if row[c] is not None:
+                accum[c].append(row[c])
+        scene_rows.append(row)
+
+    def _fmt(v):
+        return f"{v:.4f}" if isinstance(v, float) else (str(v) if v is not None else "-")
+
+    header_cols = ["scene"] + display_cols
+    col_w = {c: max(len(c), 8) for c in header_cols}
+    for row in scene_rows:
+        for c in header_cols:
+            col_w[c] = max(col_w[c], len(_fmt(row.get(c))))
+
+    sep = "  "
+    header_str = sep.join(c.ljust(col_w[c]) for c in header_cols)
+    hline      = sep.join("-" * col_w[c] for c in header_cols)
+
+    logger.info("\n📊 Reconstruction Evaluation Summary")
+    print(header_str)
+    print(hline)
+    for row in scene_rows:
+        print(sep.join(_fmt(row.get(c)).ljust(col_w[c]) for c in header_cols))
+    print(hline)
+
+    mean_row = {"scene": f"MEAN({len(scene_rows)})"}
+    for c in display_cols:
+        vals = accum[c]
+        mean_row[c] = sum(vals) / len(vals) if vals else float("nan")
+    print(sep.join(_fmt(mean_row.get(c)).ljust(col_w[c]) for c in header_cols))
+    print()
+
+    if len(list(data_idx)) > 1:
+        overall_metrics_dir = osp.join(args.output_dir, args.dataset_type, args.model_name,
+                                       "overall_metrics", f"kf_{args.kf_every}")
+        os.makedirs(overall_metrics_dir, exist_ok=True)
+        suffix = f"_{args.vis_tag}" if args.vis_tag else ""
+        overall_metrics_file = osp.join(overall_metrics_dir,
+                                        f"overall_metrics{suffix}_{datetime.now().strftime('%Y%m%d_%H%M')}.json")
+        with open(overall_metrics_file, "w") as f:
+            json.dump(all_metrics, f, indent=2)
+        logger.info(f"📌 Saved overall metrics to {overall_metrics_file}")
+
+
+if __name__ == "__main__":
+    parser = get_args_parser()
+    args = parser.parse_args()
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_dir = os.path.join("./logs", args.dataset_type)
+    os.makedirs(log_dir, exist_ok=True)
+    scene_name = "all" if args.scene_name == [] else args.scene_name[0].replace("/", "-")
+    if args.vis_tag:
+        scene_name += f"_{args.vis_tag}"
+    this_log = os.path.join(log_dir, f"{scene_name}_{timestamp}.txt")
+    with open(this_log, "w") as f:
+        f.write("python " + " ".join(sys.argv) + "\n")
+    print(f"Logging to {this_log}")
+    main(args)

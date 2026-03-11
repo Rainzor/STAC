@@ -1,0 +1,21 @@
+# Copyright (c) 2024-2026 CausalVGGT Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# pyproject.toml for merger-cuda (CUDA Merger Kernels for CausalVGGT)
+#
+# Keep this file minimal — only [build-system].  All metadata, packages, and
+# ext_modules are defined in setup.py so that `pip install -e .` falls back to
+# setuptools "compat" editable mode and correctly triggers CUDA compilation.
+#
+# Usage:
+#   pip install -e merger-cuda          # development install (compiles CUDA)
+#   pip install merger-cuda             # regular install
+
+[build-system]
+requires = [
+    "setuptools>=64",
+    "wheel",
+    "torch>=2.0.0",
+]
+build-backend = "setuptools.build_meta"
+
