@@ -80,14 +80,11 @@ Modern feed-forward 3D reconstruction models (e.g. [VGGT](https://github.com/fac
 ### Attention Modes
 
 
-| Mode                   | Description                                      |
-| ---------------------- | ------------------------------------------------ |
-| `full`                 | Standard full attention (memory ∝ N²)            |
-| `causal`               | Strictly causal attention                        |
-| `window` / `window_kv` | Sliding window KV cache                          |
-| `window_chunk`         | Chunked sliding window                           |
-| `window_merge`         | Window + voxel-based spatial KV merging          |
-| `window_chunk_merge`   | Chunked window + voxel merging (**recommended**) |
+| Mode                   | Streaming | Description                                      |
+| ---------------------- | --------- | ------------------------------------------------ |
+| `full`                 | No        | Standard full attention (memory ∝ N²)            |
+| `causal` / `window_kv` | Yes       | Sliding window KV cache (frame-by-frame)         |
+| `window_chunk_merge`   | Yes       | Chunked window + voxel merging (**recommended**) |
 
 
 ## Installation
@@ -340,9 +337,10 @@ python demo/demo_colmap.py --scene_dir /path/to/scene --output_dir output/colmap
 
 ## Key Arguments
 
-**Command Line Arguments**
+<details>
+<summary><span style="font-weight: bold;">Command Line Arguments</span></summary>
 
-#### --model_name
+  #### --model_name
 
   Model variant to use. `causalvggt` by default.
 
@@ -424,6 +422,9 @@ python demo/demo_colmap.py --scene_dir /path/to/scene --output_dir output/colmap
 
   Keyframe sampling interval — process every N-th frame. `1` (every frame) by default.
 
+</details>
+<br>
+
 **Environment variables:**
 
 Set `VERBOSE=1` to print per-frame KV cache statistics:
@@ -443,7 +444,6 @@ MERGER_MEM_PROFILE=1 python eval/long_recon/launch.py ...
 ```
 STAC/
 ├── main.py                       # Legacy CLI (basic modes only; use eval/ scripts for STAC)
-├── eval.py                       # Legacy unified evaluation
 ├── requirements.txt              # Python dependencies
 │
 ├── src/
@@ -460,7 +460,8 @@ STAC/
 │   │   ├── stac_voxel.py         #   Voxel-based KV merging + retrieval
 │   │   ├── voxel.py              #   BinaryVoxel / HashVoxel
 │   │   ├── merger.py             #   KV merge with slab/segment allocator
-│   │   └── allocator.py          #   Slab / segment memory allocators
+│   │   ├── allocator.py          #   Slab / segment memory allocators
+│   │   └── flash_attn_triton.py  #   Triton kernels (flash attention + col-sum scoring)
 │   └── vggt/                     # Original VGGT (upstream reference)
 │
 ├── eval/
