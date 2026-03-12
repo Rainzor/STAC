@@ -656,6 +656,14 @@ void MergerWrapper::ensure_capacity(int64_t num_voxels) {
 
     if (use_seg_mode_ && seg_buf_cap_ > 0) {
         expand_seg_row_metadata(old_S_tot, config_.S_tot);
+
+        // Expand voxel_zone_map to match new V_alloc (zero-fill new entries)
+        if (voxel_zone_map_.defined() && voxel_zone_map_.size(0) < new_alloc) {
+            auto opts_i32 = torch::TensorOptions().dtype(torch::kInt32).device(device_);
+            auto old_map = voxel_zone_map_;
+            voxel_zone_map_ = torch::zeros({new_alloc}, opts_i32);
+            voxel_zone_map_.narrow(0, 0, old_alloc).copy_(old_map);
+        }
     }
 
     if (!use_seg_mode_) {
@@ -852,7 +860,9 @@ void MergerWrapper::print_seg_pool_stats(cudaStream_t stream) {
     int32_t* s = stats_cpu.data_ptr<int32_t>();
 
     int32_t buf_free_top = seg_buf_free_top_.item<int32_t>();
-    int32_t piv_free_top = seg_piv_free_top_.item<int32_t>();
+    int32_t piv_free_top = (piv_zone_top_.defined() && config_.piv_num_zones > 0)
+        ? piv_zone_top_.sum().item<int32_t>()
+        : seg_piv_free_top_.item<int32_t>();
 
     int P = (int)config_.P;
     int B = (int)config_.B;
@@ -904,6 +914,51 @@ void MergerWrapper::print_seg_pool_stats(cudaStream_t stream) {
         buf_pool_mb, buf_indir_mb, piv_pool_mb, piv_indir_mb,
         buf_pool_mb + buf_indir_mb + piv_pool_mb + piv_indir_mb);
     fflush(stderr);
+
+    // Pivot zone utilization distribution
+    if (piv_zone_top_.defined() && config_.piv_num_zones > 0) {
+        int32_t Z = config_.piv_num_zones;
+        int32_t zone_cap = config_.piv_zone_cap;
+        auto zt_cpu = piv_zone_top_.cpu();
+        int32_t* zt = zt_cpu.data_ptr<int32_t>();
+
+        int32_t zones_empty = 0, zones_low = 0, zones_mid = 0, zones_high = 0, zones_full = 0;
+        int32_t total_free = 0, min_free = zone_cap, max_free = 0;
+        int32_t max_used_zone = -1;
+        int32_t max_used_val = 0;
+        for (int32_t z = 0; z < Z; z++) {
+            int32_t free_slots = zt[z];
+            int32_t used = zone_cap - free_slots;
+            total_free += free_slots;
+            if (free_slots < min_free) min_free = free_slots;
+            if (free_slots > max_free) max_free = free_slots;
+            if (used > max_used_val) { max_used_val = used; max_used_zone = z; }
+
+            float usage_pct = zone_cap > 0 ? 100.0f * used / zone_cap : 0.0f;
+            if (used == 0) zones_empty++;
+            else if (usage_pct < 25.0f) zones_low++;
+            else if (usage_pct < 75.0f) zones_mid++;
+            else if (used < zone_cap) zones_high++;
+            else zones_full++;
+        }
+        int32_t total_used = (int32_t)seg_piv_cap_ - total_free;
+        int32_t zones_active = Z - zones_empty;
+        float avg_used = zones_active > 0 ? (float)total_used / zones_active : 0.0f;
+
+        fprintf(stderr,
+            "[ZONE-UTIL] Z=%d zone_cap=%d | total_used=%d/%ld(%.1f%%)"
+            " active_zones=%d/%d"
+            " | empty=%d <25%%=%d 25-75%%=%d >75%%=%d full=%d"
+            " | avg_used_per_active=%.1f max_zone=%d(used=%d)"
+            " free_range=[%d,%d]\n",
+            Z, zone_cap, total_used, seg_piv_cap_,
+            100.0f * total_used / seg_piv_cap_,
+            zones_active, Z,
+            zones_empty, zones_low, zones_mid, zones_high, zones_full,
+            avg_used, max_used_zone, max_used_val,
+            min_free, max_free);
+        fflush(stderr);
+    }
 
     // Pivot C distribution stats
     auto pc_stats_dev = torch::zeros({PIV_C_STATS_SIZE}, opts_i32);
@@ -1129,22 +1184,37 @@ void MergerWrapper::ensure_workspace(int64_t E_max,
     bool mode_changed = (skip_packed != workspace_skip_packed_) ||
                         (skip_combined_kv != workspace_skip_combined_kv_) ||
                         (new_piv_cap != workspace_new_piv_cap_);
-    if (E_max <= workspace_E_max_ && !mode_changed) return;
+
+    // Shrink the workspace when E_max drops well below the high-water mark.
+    // This reclaims memory after transient edge-count spikes.
+    bool should_shrink = workspace_.defined() &&
+                         (E_max < workspace_E_max_ / 2) &&
+                         (workspace_.nbytes() > 256ULL * 1024 * 1024);
+
+    if (E_max <= workspace_E_max_ && !mode_changed && !should_shrink) return;
 
     int64_t overflow_max_for_ws = skip_combined_kv ? 0 : config_.overflow_max;
     size_t req = backend::MergerWorkspace::required(
         E_max, E_max, config_.D, overflow_max_for_ws, config_.dtype, config_.B,
         skip_packed, skip_combined_kv, new_piv_cap);
-    bool needs_alloc = ((size_t)workspace_.numel() < req) || mode_changed;
+
+    // Add 25% headroom to reduce future realloc frequency
+    size_t alloc_size = req + req / 4;
+
+    bool needs_alloc = ((size_t)workspace_.numel() < req) || mode_changed || should_shrink;
     if (merger_mem_profile_enabled()) {
-        fprintf(stderr, "  [MEM-CUDA] ensure_workspace: E_max %ld->%ld, req=%.1fMB%s%s\n",
+        fprintf(stderr, "  [MEM-CUDA] ensure_workspace: E_max %ld->%ld, req=%.1fMB%s%s%s\n",
                 workspace_E_max_, E_max, (double)req / (1024.0 * 1024.0),
                 needs_alloc ? " (REALLOC)" : " (reuse)",
+                should_shrink ? " (SHRINK)" : "",
                 skip_packed ? " [slim]" : "");
     }
     if (needs_alloc) {
         print_cuda_mem("ensure_workspace:before-alloc");
-        workspace_ = torch::empty({(int64_t)req}, torch::TensorOptions().dtype(torch::kUInt8).device(device_));
+        // Release old workspace FIRST so old + new don't coexist in GPU memory.
+        // The workspace is purely temporary (no persistent data to preserve).
+        workspace_ = torch::Tensor();
+        workspace_ = torch::empty({(int64_t)alloc_size}, torch::TensorOptions().dtype(torch::kUInt8).device(device_));
         print_cuda_mem("ensure_workspace:after-alloc");
     }
     workspace_E_max_ = E_max;
@@ -2422,16 +2492,41 @@ void MergerWrapper::set_seg_mode(bool enabled) {
     use_seg_mode_ = enabled;
 }
 
+void MergerWrapper::set_voxel_zones(torch::Tensor zones) {
+    TORCH_CHECK(zones.is_cuda() && zones.dtype() == torch::kInt32,
+                "set_voxel_zones: zones must be a CUDA int32 tensor");
+    c10::cuda::CUDAGuard guard(device_);
+    int64_t n = zones.size(0);
+    int64_t V = config_.V_alloc;
+    if (!voxel_zone_map_.defined() || voxel_zone_map_.size(0) < V) {
+        auto opts_i32 = torch::TensorOptions().dtype(torch::kInt32).device(device_);
+        voxel_zone_map_ = torch::zeros({V}, opts_i32);
+    }
+    int64_t copy_len = std::min(n, V);
+    int32_t Z = config_.piv_num_zones;
+    voxel_zone_map_.narrow(0, 0, copy_len).copy_(
+        zones.narrow(0, 0, copy_len).clamp(0, Z - 1));
+    seg_views_.voxel_zone_map = voxel_zone_map_.data_ptr<int32_t>();
+}
+
 void MergerWrapper::init_seg_pools() {
     c10::cuda::CUDAGuard guard(device_);
     int64_t D = config_.D, P = config_.P, B = config_.B, S_tot = config_.S_tot;
 
-    // Initial segment pool capacities: much smaller than S_tot * B/P since
-    // average fill is well below 100%. Start with 2*S_tot segments for each.
+    // Buffer: start with 2*S_tot, grows dynamically as before.
     seg_buf_cap_ = std::max(int64_t(8192), S_tot * 2);
-    seg_piv_cap_ = std::max(int64_t(8192), S_tot * 2);
     seg_buf_growth_ = std::max(int64_t(4096), seg_buf_cap_ / 4);
-    seg_piv_growth_ = std::max(int64_t(4096), seg_piv_cap_ / 4);
+
+    // Pivot: configurable multiplier over theoretical max (S_tot * P).
+    // Default 0.5x saves ~2 GB vs old 1.5x while leaving ~60% headroom over
+    // observed peak usage.  Override: MERGER_PIV_POOL_MULT=0.75
+    int32_t Z = config_.piv_num_zones;  // 512
+    const char* piv_mult_env = std::getenv("MERGER_PIV_POOL_MULT");
+    double piv_mult = piv_mult_env ? std::atof(piv_mult_env) : 0.5;
+    seg_piv_cap_ = std::max(int64_t(16384), (int64_t)(S_tot * P * piv_mult));
+    seg_piv_cap_ = ((seg_piv_cap_ + Z - 1) / Z) * Z;  // round up to multiple of Z
+    seg_piv_growth_ = 0;  // no expansion for pivot pool
+    config_.piv_zone_cap = (int32_t)(seg_piv_cap_ / Z);
 
     print_cuda_mem("init_seg_pools:before");
     if (merger_mem_profile_enabled()) {
@@ -2466,9 +2561,24 @@ void MergerWrapper::init_seg_pools() {
     seg_piv_C_ = torch::zeros({seg_piv_cap_}, opts_f32);
     seg_piv_K_seed_ = torch::zeros({seg_piv_cap_, D}, opts_kv);
     seg_piv_S_seed_ = torch::zeros({seg_piv_cap_}, opts_f32);
-    seg_piv_free_stack_ = torch::arange(seg_piv_cap_, opts_i32);
-    seg_piv_free_top_ = torch::tensor({(int32_t)seg_piv_cap_}, opts_i32);
     piv_row_seg_ = torch::full({S_tot, P}, -1, opts_i32);
+
+    // Pivot zone-partitioned free stack:
+    // Zone z owns sids [z*zone_cap, (z+1)*zone_cap).
+    // Stack section for zone z: seg_piv_free_stack[z*zone_cap .. (z+1)*zone_cap - 1]
+    int32_t zone_cap = config_.piv_zone_cap;
+    seg_piv_free_stack_ = torch::empty({seg_piv_cap_}, opts_i32);
+    for (int32_t z = 0; z < Z; z++) {
+        seg_piv_free_stack_.narrow(0, (int64_t)z * zone_cap, zone_cap)
+            .copy_(torch::arange((int64_t)z * zone_cap, (int64_t)(z + 1) * zone_cap, opts_i32));
+    }
+    piv_zone_top_ = torch::full({(int64_t)Z}, zone_cap, opts_i32);
+
+    // Global top kept for backward compat (unused when zone mode is active)
+    seg_piv_free_top_ = torch::tensor({(int32_t)seg_piv_cap_}, opts_i32);
+
+    // Voxel zone map: default zone 0 until set_voxel_zones() is called
+    voxel_zone_map_ = torch::zeros({config_.V_alloc}, opts_i32);
 
     // Reuse row_state and row_count from contiguous pool (already allocated)
     // They are buf_row_state_, buf_row_count_, piv_row_state_, piv_row_count_
@@ -2502,6 +2612,19 @@ void MergerWrapper::update_seg_views() {
 
     sv.seg_buf_cap = seg_buf_cap_;
     sv.seg_piv_cap = seg_piv_cap_;
+
+    // Pivot zone allocator views
+    if (piv_zone_top_.defined() && voxel_zone_map_.defined()) {
+        sv.voxel_zone_map = voxel_zone_map_.data_ptr<int32_t>();
+        sv.piv_zone_top = piv_zone_top_.data_ptr<int32_t>();
+        sv.piv_num_zones = config_.piv_num_zones;
+        sv.piv_zone_cap = config_.piv_zone_cap;
+    } else {
+        sv.voxel_zone_map = nullptr;
+        sv.piv_zone_top = nullptr;
+        sv.piv_num_zones = 0;
+        sv.piv_zone_cap = 0;
+    }
 }
 
 void MergerWrapper::expand_seg_buf_pool(int64_t old_cap, int64_t new_cap) {
@@ -2647,15 +2770,27 @@ void MergerWrapper::ensure_seg_pool_slots(cudaStream_t stream) {
         print_cuda_mem("seg_expand_buf:after");
     }
 
-    int64_t piv_threshold = std::max(seg_piv_growth_, int64_t(2048));
-    if (piv_top_h < piv_threshold) {
-        int64_t new_cap = seg_piv_cap_ + seg_piv_growth_;
-        fprintf(stderr, "  [SEG-EXPAND] piv_pool: %ld->%ld (free=%d, threshold=%ld)\n",
-                seg_piv_cap_, new_cap, piv_top_h, piv_threshold);
-        print_cuda_mem("seg_expand_piv:before");
-        expand_seg_piv_pool(seg_piv_cap_, new_cap);
-        update_seg_views();
-        print_cuda_mem("seg_expand_piv:after");
+    // Pivot pool: zone-mode, no expansion. Warn if critically low.
+    if (piv_zone_top_.defined()) {
+        int32_t piv_total_free = piv_zone_top_.sum().item<int32_t>();
+        int64_t piv_threshold = std::max(int64_t(2048), seg_piv_cap_ / 8);
+        if (piv_total_free < piv_threshold) {
+            fprintf(stderr, "  [SEG-WARN] piv_zone_pool critically low: %d free of %ld "
+                    "(threshold=%ld). Increase init piv_pool_cap or reduce voxel count.\n",
+                    piv_total_free, seg_piv_cap_, piv_threshold);
+            fflush(stderr);
+        }
+    } else {
+        int64_t piv_threshold = std::max(seg_piv_growth_, int64_t(2048));
+        if (piv_top_h < piv_threshold) {
+            int64_t new_cap = seg_piv_cap_ + seg_piv_growth_;
+            fprintf(stderr, "  [SEG-EXPAND] piv_pool: %ld->%ld (free=%d, threshold=%ld)\n",
+                    seg_piv_cap_, new_cap, piv_top_h, piv_threshold);
+            print_cuda_mem("seg_expand_piv:before");
+            expand_seg_piv_pool(seg_piv_cap_, new_cap);
+            update_seg_views();
+            print_cuda_mem("seg_expand_piv:after");
+        }
     }
 }
 
@@ -2821,7 +2956,7 @@ MergerWrapper::insert_and_merge_with_rows_seg(
         2 * G_max * B, stream);
     check_cuda("buf_free_seg");
 
-    // Remerge: insert new pivots into pivot seg pool
+    // Remerge: insert new pivots into pivot seg pool (zone-aware)
     backend::detail::remerge_fused_seg(
         ws.new_piv_K, ws.new_piv_V, ws.new_piv_W, ws.new_piv_S, ws.new_piv_C,
         ws.new_piv_Ks, ws.new_piv_Ss,
@@ -2830,7 +2965,10 @@ MergerWrapper::insert_and_merge_with_rows_seg(
         sv.seg_piv_K_seed, sv.seg_piv_S_seed,
         sv.piv_row_seg, sv.piv_row_state, sv.piv_row_count,
         sv.seg_piv_free_stack, sv.seg_piv_free_top,
-        P, D, G_max, config_.S_tot, config_.dtype, stream, ws.diag);
+        P, D, G_max, config_.S_tot, config_.dtype, stream,
+        sv.voxel_zone_map, sv.piv_zone_top,
+        sv.piv_zone_cap, sv.piv_num_zones, config_.V_alloc,
+        ws.diag);
     check_cuda("remerge_fused_seg");
 
     // Step 10.5: Overflow absorption
@@ -2901,6 +3039,16 @@ MergerWrapper::insert_and_merge_with_rows_seg(
         int ov_nop = diag_host[backend::DIAG_OVER_O2O_NO_PIVOT];
         int ov_low = diag_host[backend::DIAG_OVER_O2O_LOW_SIM];
         int ov_drp = diag_host[backend::DIAG_OVER_O2O_DROPPED];
+        int zone_total = diag_host[backend::DIAG_ZONE_ALLOC_TOTAL];
+        int zone_hit   = diag_host[backend::DIAG_ZONE_ALLOC_HIT];
+        int zone_spill = diag_host[backend::DIAG_ZONE_ALLOC_SPILL];
+        int zone_sdist = diag_host[backend::DIAG_ZONE_ALLOC_SPILL_DIST];
+        int zone_exhaust = diag_host[backend::DIAG_ZONE_ALLOC_EXHAUSTED];
+        int zone_reuse = diag_host[backend::DIAG_ZONE_ALLOC_VICTIM_REUSE];
+        float zone_hit_pct = zone_total > 0 ? 100.0f * zone_hit / zone_total : 0.0f;
+        float zone_spill_pct = zone_total > 0 ? 100.0f * zone_spill / zone_total : 0.0f;
+        float zone_avg_spill = zone_spill > 0 ? (float)zone_sdist / zone_spill : 0.0f;
+
         fprintf(stderr,
             "[DIAG-SEG] E_in=%d | o2o: absorbed=%d reserved=%d no_pivot=%d low_sim=%d dropped=%d"
             " | buf: kept=%d over_noslot=%d over_excess=%d full_rows=%d"
@@ -2912,6 +3060,14 @@ MergerWrapper::insert_and_merge_with_rows_seg(
             a2o_merged, a2o_piv, over_absorbed,
             ov_abs, ov_res, ov_nop, ov_low, ov_drp,
             final_over_count);
+        if (zone_total > 0 || zone_reuse > 0) {
+            fprintf(stderr,
+                "[DIAG-ZONE] alloc_total=%d hit=%d(%.1f%%) spill=%d(%.1f%% avg_dist=%.1f)"
+                " exhausted=%d victim_reuse=%d\n",
+                zone_total, zone_hit, zone_hit_pct,
+                zone_spill, zone_spill_pct, zone_avg_spill,
+                zone_exhaust, zone_reuse);
+        }
         fflush(stderr);
     }
 

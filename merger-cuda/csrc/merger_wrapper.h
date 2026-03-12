@@ -283,6 +283,10 @@ private:
     int64_t seg_buf_growth_ = 0;
     int64_t seg_piv_growth_ = 0;
 
+    // Pivot zone allocator (Morton-based spatial locality)
+    torch::Tensor piv_zone_top_;        // [Z] per-zone atomic stack tops
+    torch::Tensor voxel_zone_map_;      // [V_alloc] voxel_id -> zone_id
+
     void init_seg_pools();
     void update_seg_views();
     void expand_seg_buf_pool(int64_t old_cap, int64_t new_cap);
@@ -316,6 +320,8 @@ public:
 
     bool is_seg_mode() const { return use_seg_mode_; }
     void set_seg_mode(bool enabled);
+
+    void set_voxel_zones(torch::Tensor zones);
 };
 
 inline bool has_merger_wrapper() {

@@ -88,38 +88,35 @@ class VoxelKVMerger:
         self.dtype = dtype
         self.device = device
         self.debug = kwargs.get("debug", False)
-        self.ablate = kwargs.get("ablate", [])
         self.backend = backend
         init_voxels = max(1, int(init_voxels))
         self._voxel_alloc = init_voxels
         self._voxel_offset = 0
         self._token_count = 0
-        # self._mapping: dict[Tuple[int, int], int] = dict()  # (h,v) -> row index
 
         # ---- PIVOT POOL (merged tokens) ----
         self.piv_cap = int(pivot_cap)
-        self.use_seed = "use_seed" in self.ablate
         piv_fields_specs = {"K": "vector", "V": "vector", "W": "scalar", "S": "scalar", "C": "scalar"}
-        if self.use_seed:
-            seed_fields_specs = {"K_seed": "vector", "S_seed": "scalar"}
-        else:
-            seed_fields_specs = dict()
-        self_piv_kwargs = dict(      
+        seed_fields_specs = {"K_seed": "vector", "S_seed": "scalar"}
+        # Use a single allocator type for both pivots and buffer
+        self._alloc_type = kwargs.get("allocator", "slab")  # also drives CUDA seg_mode
+
+        self_piv_kwargs = dict(
                 buf_cap=pivot_cap,         # == self.P
                 head_dim=head_dim,         # == self.D
-                num_heads=num_heads,          
+                num_heads=num_heads,
                 capacity=init_voxels,
-                growth=64,
-                growth_ratio=0.1,
-                free_policy="immediate",
+                growth=kwargs.get("slab_growth", 64),
+                growth_ratio=kwargs.get("slab_growth_ratio", 0.1),
+                free_policy=kwargs.get("slab_free_policy", "immediate"),
+                micro_slab_size=kwargs.get("seg_size", 4),
                 field_specs={**piv_fields_specs, **seed_fields_specs},
-                # field_specs=piv_fields_specs,
                 device=device,
                 dtype=dtype,
                 debug=self.debug,
             )
 
-        self.pivots: BufferInterface = create_buffer(alloc_type="slab", **self_piv_kwargs)
+        self.pivots: BufferInterface = create_buffer(alloc_type=self._alloc_type, **self_piv_kwargs)
         self.pivots.resize_rows(self.H, self._voxel_alloc)
         # ---- BUFFER (unmerged tokens) ----
         self.buf_cap = int(budget_cap)
@@ -128,7 +125,7 @@ class VoxelKVMerger:
                                 head_dim=head_dim,
                                 num_heads=num_heads,
                                 capacity=kwargs.get("slab_cap", 1024),
-                                growth=kwargs.get("slab_growth", 1024), 
+                                growth=kwargs.get("slab_growth", 1024),
                                 growth_ratio=kwargs.get("slab_growth_ratio", 0.25),
                                 free_policy=kwargs.get("slab_free_policy", "immediate"),
                                 micro_slab_size=kwargs.get("seg_size", 4),
@@ -136,9 +133,7 @@ class VoxelKVMerger:
                                 dtype=dtype,
                                 debug=kwargs.get("alloc_debug", False),
                             )
-        buf_alloc_type = kwargs.get("allocator", "slab")
-        self._alloc_type = buf_alloc_type   # also drives CUDA seg_mode
-        self.buffer: BufferInterface = create_buffer(alloc_type=buf_alloc_type, **self._buf_kwargs)
+        self.buffer: BufferInterface = create_buffer(alloc_type=self._alloc_type, **self._buf_kwargs)
         self.buffer.resize_rows(self.H, self._voxel_alloc)
         # ---- Merge control ----
         self.replace_threshold = float(replace_thresh)
@@ -158,6 +153,7 @@ class VoxelKVMerger:
         
         # CUDA merger wrapper (lazily initialized)
         self._stac_merger = None
+        self._pending_voxel_zones = None
         self.backend = backend
         if self.backend == "cuda":
             self._init_cuda_merger()
@@ -197,8 +193,11 @@ class VoxelKVMerger:
             raise
 
     def reset(self):
-        super().reset()
-        
+        """No-op for compatibility with KV manager lifecycle (state is recreated on ensure_capacity)."""
+        pass
+
+    def update_voxel_zones(self, voxel_zones: torch.Tensor):
+        self._pending_voxel_zones = voxel_zones
 
     def ensure_capacity(self, V_needed: int):
         self._voxel_offset = max(V_needed, self._voxel_offset)
@@ -249,7 +248,7 @@ class VoxelKVMerger:
         return torch.nonzero(change, as_tuple=False).squeeze(1)
 
     def _row_index(self, h: Union[int,torch.Tensor], v: Union[int, torch.Tensor]) -> torch.Tensor:
-        """展平后的行索引: row = h * self._voxel_alloc + v"""
+        """Flattened row index: row = h * self._voxel_alloc + v"""
         # return int(h) * int(self._voxel_alloc) + int(v)
         h = torch.as_tensor(h, device=self.device, dtype=torch.long)
         v = torch.as_tensor(v, device=self.device, dtype=torch.long)
@@ -468,7 +467,7 @@ class VoxelKVMerger:
             Sseed_new: Tensor [G]
         --------------
         """
-        # 4) 读取旧的 pivots（每行至多 P 个）
+        # 4) Read existing pivots (at most P per row)
         oldPack = self.pivots.read_rows_dict(rows)
         Kp = oldPack["K"]       # [G,P,D]
         Vp = oldPack["V"]         # [G,P,D]
@@ -476,23 +475,19 @@ class VoxelKVMerger:
         Sp = oldPack["S"]         # [G,P]
         Cp = oldPack["C"]         # [G,P]
         Mp = oldPack["M"]         # [G,P] bool
-        if self.use_seed:
-            Kpseed = oldPack["K_seed"]  # [G,P,D] (已归一化的 seed keys)
-            Spseed = oldPack["S_seed"]  # [G,P]
-        else:
-            Kpseed = F.normalize(Kp, dim=-1)  # [G,P,D]
-            Spseed = Sp.clone()                     # [G,P]
+        Kpseed = oldPack["K_seed"]  # [G,P,D] normalized seed keys
+        Spseed = oldPack["S_seed"]  # [G,P]
 
         device = Kp.device
         P = Kp.size(1)
         G = rows.size(0)
         arange_g = torch.arange(G, device=device)
 
-        # 5) 计算每行已占用 pivot 数与是否满行
+        # 5) Count occupied pivots per row and detect full rows
         offset_pivots = Mp.sum(dim=1)                  # [G]
         full_mask = (offset_pivots == P)               # [G] bool
 
-        # 6) 行满时选择牺牲者：contrib = 0.7*log(S) + 0.3*log(C) 最小者
+        # 6) When row is full, pick victim: slot with smallest contrib (W here)
         # contrib = 0.7 * torch.log(Sp.clamp_min(1e-6)) + 0.3 * torch.log(Cp.clamp_min(1e-6))  # [G,P]
         contrib = Wp
         j_victim_all = torch.argmin(contrib, dim=1)    # [G]
@@ -500,32 +495,18 @@ class VoxelKVMerger:
         Gf = int(idx_full.numel())
 
         if Gf > 0:
-            # 7) 为每个满行找到牺牲者的最近邻（按 seed 余弦）
-            #~ Experiment 1: Use normalized Kp directly instead of Kpseed
+            # 7) For each full row, find nearest neighbour of victim by seed cosine
             Kpn_full = Kpseed.index_select(0, idx_full)              # [Gf,P,D]
-
             sim_full = torch.matmul(Kpn_full, Kpn_full.transpose(1, 2))  # [Gf,P,P]
-            # 屏蔽对角（避免选择自身）
             sim_full.diagonal(dim1=1, dim2=2).fill_(-float("inf"))
 
             j_victim_full = j_victim_all.index_select(0, idx_full)             # [Gf]
             victim_rows = sim_full[torch.arange(Gf, device=device), j_victim_full, :]  # [Gf,P]
             j_nei_full = victim_rows.argmax(dim=1)                             # [Gf]
-            #~ Experiment 0: Compare approximated sim value instead of recomputing
-            scale_ij = 1.0
-            if "exp0" in self.ablate or "zero_approx" in self.ablate:
-                scale_ij = torch.as_tensor(1.0,device=device)  # 近似值，见下方注释
-                W_jp = Wp[idx_full, j_victim_full]*scale_ij  # [Gf]
-            elif "sim_approx" in self.ablate:
-                sim_j = victim_rows.gather(1, j_nei_full.unsqueeze(1)).squeeze(1)  # [Gf]
-                W_jp = sim_j.clamp_min(1e-6)  # [Gf]
-            else:
-                sim_j = victim_rows.gather(1, j_nei_full.unsqueeze(1)).squeeze(1)  # [Gf]
-                scale_ij = torch.exp(sim_j - 1.0)  # 近似值，见下方注释
-                W_jp = Wp[idx_full, j_victim_full]*scale_ij  # [Gf]
-            # 8) 把牺牲者按权重合入最近邻，释放 1 个槽
-            #!: 这里近似 exp(sim(i,j)) 作为权重, cos(a),cos(b) ~ 1.0
-            #!: exp(cos(a+b)) ~ exp(cos(a)) * exp(cos(b)) / exp(1.0)
+            sim_j = victim_rows.gather(1, j_nei_full.unsqueeze(1)).squeeze(1)  # [Gf]
+            scale_ij = torch.exp(sim_j - 1.0)
+            W_jp = Wp[idx_full, j_victim_full] * scale_ij  # [Gf]
+            # 8) Merge victim into nearest neighbour by weight, free one slot
             Wj = W_jp
             Wk = Wp[idx_full, j_nei_full]             # [Gf]
             denom = (Wj + Wk).clamp_min(1e-8)         # [Gf]
@@ -537,7 +518,7 @@ class VoxelKVMerger:
             Vk = Vp[idx_full, j_nei_full,  :]         # [Gf,D]
             Vj = Vp[idx_full, j_victim_full, :]       # [Gf,D]
 
-            # 写回邻居
+            # Write back into neighbour slot
             Kk_new = frac_j * Kj.float() + frac_k * Kk.float()        # [Gf,D]
             Vk_new = frac_j * Vj.float() + frac_k * Vk.float()        # [Gf,D]
             Wk_new = denom                             # [Gf]
@@ -551,15 +532,15 @@ class VoxelKVMerger:
             Sp[idx_full, j_nei_full]    = Sk_new
             Cp[idx_full, j_nei_full]    = Ck_new
 
-            # 牺牲者位置标为无效（释放槽位）
+            # Mark victim slot as invalid (free the slot)
             Mp[idx_full, j_victim_full] = False
 
-        # 9) 计算每行写入的新槽位索引：
-        #    - 行满：写入到牺牲者槽位
-        #    - 行未满：写入到 offset（等于当前 True 计数，保证与原实现一致的“尾部追加”）
+        # 9) Compute write slot index per row:
+        #    - full row: write to victim slot
+        #    - non-full: write at offset (current True count, append at tail)
         write_idx = torch.where(full_mask, j_victim_all, offset_pivots.to(torch.long))  # [G]
 
-        # 10) 一次性写入 newPack 到对应槽位（无循环）
+        # 10) Write newPack to the corresponding slots in one go (no loop)
         Kp[arange_g, write_idx, :] = Pack_new["K"]
         Vp[arange_g, write_idx, :] = Pack_new["V"]
         Wp[arange_g, write_idx]    = Pack_new["W"]
@@ -568,16 +549,13 @@ class VoxelKVMerger:
         Mp[arange_g, write_idx]    = True
 
 
-        # 11) 写回
+        # 11) Write back
+        Kpseed[arange_g, write_idx, :] = Pack_new["K_seed"]
+        Spseed[arange_g, write_idx] = Pack_new["S_seed"]
         data = {
             "K": Kp, "V": Vp, "W": Wp, "S": Sp, "C": Cp, "M": Mp,
-            # "K_seed": Kpseed.to(self.dtype), "S_seed": Spseed,
+            "K_seed": Kpseed.to(self.dtype), "S_seed": Spseed,
         }
-        if self.use_seed:
-            Kpseed[arange_g, write_idx, :] = Pack_new["K_seed"]
-            Spseed[arange_g, write_idx]    = Pack_new["S_seed"]
-            data["K_seed"] = Kpseed.to(self.dtype)
-            data["S_seed"] = Spseed
         self.pivots.write_rows_dict(rows, data)
 
 
@@ -634,13 +612,9 @@ class VoxelKVMerger:
         Cp = pack["C"].float()      # [G, P]
         Mp = pack["M"].clone()      # [G, P] bool
         
-        # Get seed keys (normalized pivot keys or explicit seeds)
-        if self.use_seed and "sel_seed" in self.ablate:
-            Kp_seed = pack["K_seed"].float()  # [G, P, D]
-            Sp_seed = pack["S_seed"].float()  # [G, P]
-        else:
-            Kp_seed = F.normalize(Kp, dim=-1, eps=1e-6)
-            Sp_seed = Sp.clone()
+        # Seed keys for similarity (normalized)
+        Kp_seed = pack["K_seed"].float()  # [G, P, D]
+        Sp_seed = pack["S_seed"].float()  # [G, P]
         
         G, P, D = Kp.shape
         
@@ -707,40 +681,29 @@ class VoxelKVMerger:
                 "M": Mp,
             }
             
-            # Optionally update seeds if new tokens have higher scores
-            if self.use_seed and update_seed and "repl_seed" in self.ablate:
+            # Update seeds when new tokens have higher scores
+            if update_seed:
                 ids_merge = merge_mask.nonzero(as_tuple=False).squeeze(1)
                 rows_merge = inv_rows[ids_merge]  # [M]
                 scores_merge = S_tok.index_select(0, ids_merge)  # [M]
-                
-                # Find max score per group among merged tokens
                 uniq_g, inv_g = torch.unique(rows_merge, sorted=True, return_inverse=True)
                 max_scores = torch.full((uniq_g.numel(),), float('-inf'), device=device)
                 max_scores = max_scores.scatter_reduce(0, inv_g, scores_merge, reduce='amax', include_self=True)
-                
-                # Find first token achieving max score per group
                 is_seed = (scores_merge == max_scores.index_select(0, inv_g))
                 big = torch.full_like(ids_merge, ids_merge.numel())
                 ids_masked = torch.where(is_seed, ids_merge, big)
                 first_pos = torch.full((uniq_g.numel(),), ids_merge.numel(), device=device, dtype=torch.long)
                 first_pos = first_pos.scatter_reduce(0, inv_g, ids_masked, reduce='amin', include_self=True)
                 seed_pos = first_pos.clamp_max(ids_merge.numel() - 1)
-                
-                Kp_seed_update = K_tok.index_select(0, seed_pos)  # [G', D]
-                Sp_seed_update = S_tok.index_select(0, seed_pos)  # [G']
-                
-                # Only update if new score > existing seed score
+                Kp_seed_update = K_tok.index_select(0, seed_pos)
+                Sp_seed_update = S_tok.index_select(0, seed_pos)
                 mask = Sp_seed_update > Sp_seed.index_select(0, uniq_g)
                 if mask.any():
                     uniq_g_upd = uniq_g[mask]
                     Kp_seed.index_copy_(0, uniq_g_upd, F.normalize(Kp_seed_update[mask], dim=-1, eps=1e-6))
                     Sp_seed.index_copy_(0, uniq_g_upd, Sp_seed_update[mask])
-                
-                pack_piv_update["K_seed"] = Kp_seed.to(self.dtype)
-                pack_piv_update["S_seed"] = Sp_seed
-            elif self.use_seed:
-                pack_piv_update["K_seed"] = Kp_seed.to(self.dtype)
-                pack_piv_update["S_seed"] = Sp_seed
+            pack_piv_update["K_seed"] = Kp_seed.to(self.dtype)
+            pack_piv_update["S_seed"] = Sp_seed
             
             # Write updated pivots back
             self.pivots.write_rows_dict(uniq_rows, pack_piv_update)
@@ -888,34 +851,11 @@ class VoxelKVMerger:
             append_time += time_start.elapsed_time(time_end)
             time_start.record() 
 
-        #& --------- Merge to one pivot ---------
-        # #~ Experiment 2: flatten full buffers + overflow tokens
-        if "exp2" in self.ablate:
-            rows_buf_full = rows_buf_full.repeat_interleave(self.buf_cap)
-            Kb_full = Kb_full.view(-1, self.D)   # [F*B,D]
-            Vb_full = Vb_full.view(-1, self.D)   # [F*B,D]
-            Sb_full = Sb_full.view(-1)      # [F*B]
-            # concate over + full
-            if K_tok_over.numel() > 0:
-                Kb_full = torch.cat([Kb_full,K_tok_over], dim=0)
-                Vb_full = torch.cat([Vb_full,V_tok_over], dim=0)
-                Sb_full = torch.cat([Sb_full,S_tok_over], dim=0)
-                rows_buf_full = torch.cat([rows_buf_full, rows_tok_over], dim=0)
-            
-            # --------- Merge to one pivot ---------
-            pack_piv_new, rows_piv_new = self._cluster_merge_to_one_flat(
-                                    rows_buf_full,
-                                    Kb_full, Vb_full, Sb_full,
-                                )
-
-        # #~ Default: full buffers
-        else:
-            pack_piv_new = self._cluster_merge_to_one_budget(
-                                    Kb_full, Vb_full, Sb_full,
-                                )
-            rows_piv_new = rows_buf_full
-
-        # #~ EndExperiment
+        # Merge full buffers to one pivot per row
+        pack_piv_new = self._cluster_merge_to_one_budget(
+            Kb_full, Vb_full, Sb_full,
+        )
+        rows_piv_new = rows_buf_full
 
         if self.debug:
             time_end.record()
@@ -1128,6 +1068,9 @@ class VoxelKVMerger:
             self._stac_merger.set_seg_mode(True)
 
         self._stac_merger.ensure_capacity(self._voxel_alloc)
+        if self._pending_voxel_zones is not None and self._pending_voxel_zones.numel() > 0:
+            self._stac_merger.set_voxel_zones(self._pending_voxel_zones)
+            self._pending_voxel_zones = None
 
         if self.debug:
             time_end.record()
@@ -1505,7 +1448,6 @@ class VoxelKVMerger:
 
         # (optional) include live buffers; unchanged from your previous storage-specific path.
         # raise NotImplementedError("return_buf=True: plug your buffer gather and concat here.")
-        #TODO: Have some bugs, need to fix when use segment allocator and.....
         K_buf, V_buf, S_buf, M_buf = self.buffer.read_rows(rows_flat)
         # K_buf = pack_buf["K"] # [H*VN, B, D]
         # V_buf = pack_buf["V"] # [H*VN, B, D]

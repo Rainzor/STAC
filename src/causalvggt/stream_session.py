@@ -389,7 +389,7 @@ class StreamSession:
                         "score_threshold": 0.2,
                         "slab_growth": 1024,
                         "slab_cap": 10000,
-                        "seg_size": 4,
+                        "seg_size": 1,
                         "retrieval_size": kwargs.get("retrieval_size", -1),
                         "allocator": kwargs.get("allocator", "slab"),
                         "ablate": kwargs.get("ablate", ["default"]),

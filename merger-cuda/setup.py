@@ -12,13 +12,13 @@ Usage:
     cd merger-cuda && pip install .
     
     # Development install (editable mode)
-    cd merger-cuda && pip install -e .
+    cd merger-cuda && pip install -e .[dev]
     
-    # Install from project root
-    pip install -e merger-cuda
+    # Install from project root (non-editable only)
+    pip install merger-cuda
 
 Environment Requirements:
-    export CUDA_HOME=/usr/local/cuda-12.8
+    export CUDA_HOME=/usr/local/cuda-11.8
     export PATH=$CUDA_HOME/bin:$PATH
 
 After installation:
@@ -32,19 +32,21 @@ from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 # Get absolute path for this setup.py's directory
 _project_root = os.path.dirname(os.path.abspath(__file__))
 
-# Sources: must be relative to setup.py dir (setuptools requirement)
-# Includes: must be absolute (compilation happens in temp directories)
-CSRC_REL = "csrc"
-KERNELS_REL = os.path.join(CSRC_REL, "kernels")
+# Source paths: relative (required for editable installs)
+CSRC_DIR = "csrc"
+KERNELS_DIR = os.path.join(CSRC_DIR, "kernels")
+
+# Include paths: MUST be absolute (compilation happens in temp directories)
 INCLUDE_DIR_ABS = os.path.join(_project_root, "csrc", "include")
 CSRC_DIR_ABS = os.path.join(_project_root, "csrc")
 
+# Collect source files (relative paths)
 sources = [
-    os.path.join(CSRC_REL, "bindings.cpp"),
-    os.path.join(CSRC_REL, "stub_ops.cu"),
-    os.path.join(CSRC_REL, "merger_wrapper.cu"),
-    os.path.join(KERNELS_REL, "merger_pipeline.cu"),
-    os.path.join(KERNELS_REL, "merger_kernels.cu"),
+    os.path.join(CSRC_DIR, "bindings.cpp"),
+    os.path.join(CSRC_DIR, "stub_ops.cu"),
+    os.path.join(CSRC_DIR, "merger_wrapper.cu"),  # MergerWrapper (tensor-owning wrapper)
+    os.path.join(KERNELS_DIR, "merger_pipeline.cu"),  # Merger pipeline orchestration
+    os.path.join(KERNELS_DIR, "merger_kernels.cu"),  # Merger kernel implementations
 ]
 
 # Compiler flags
@@ -63,14 +65,9 @@ extra_compile_args = {
 
 setup(
     name="merger-cuda",
-    version="0.1.0",
-    description="merger-cuda: CUDA kernels for CausalVGGT KV Merger Pipeline",
-    author="CausalVGGT Authors",
-    license="Apache-2.0",
-    python_requires=">=3.8",
-    install_requires=["torch>=2.0.0"],
     packages=['merger_cuda'],
-    package_data={"merger_cuda": ["*.pyi"]},
+    version='0.1.0',
+    description='Stateful C++ merger class for CUDA',
     ext_modules=[
         CUDAExtension(
             name="merger_cuda._ext",

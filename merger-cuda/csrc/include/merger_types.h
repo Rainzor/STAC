@@ -66,6 +66,13 @@ enum DiagIdx : int {
     DIAG_OVER_O2O_NO_PIVOT,      // overflow tokens hitting rows with 0 valid pivots
     DIAG_OVER_O2O_LOW_SIM,       // overflow tokens: sim < thresh, became candidate
     DIAG_OVER_O2O_DROPPED,       // overflow tokens: dropped (score too low)
+    // Pivot zone allocator profiling
+    DIAG_ZONE_ALLOC_TOTAL,       // total zone_alloc_piv calls
+    DIAG_ZONE_ALLOC_HIT,         // allocated from target zone (distance 0)
+    DIAG_ZONE_ALLOC_SPILL,       // allocated from a neighbor zone (distance >= 1)
+    DIAG_ZONE_ALLOC_SPILL_DIST,  // sum of spill distances (for computing average)
+    DIAG_ZONE_ALLOC_EXHAUSTED,   // all zones exhausted, returned -1
+    DIAG_ZONE_ALLOC_VICTIM_REUSE,// pivot allocated via victim SID reuse (no zone_alloc)
     DIAG_COUNT                   // sentinel
 };
 
@@ -100,6 +107,10 @@ struct MergerConfig {
     int64_t overflow_max;   // Maximum overflow tokens to carry
     
     DType dtype;            // Data type (Float16 or BFloat16)
+
+    // Pivot zone allocator (Morton-based spatial locality)
+    int32_t piv_num_zones;  // Z: number of Morton zones (default 512 for zone_bits=3)
+    int32_t piv_zone_cap;   // seg_piv_cap / Z: segments per zone (derived)
     
     // Default constructor with sensible defaults
     MergerConfig()
@@ -108,7 +119,8 @@ struct MergerConfig {
         , buf_pool_cap(S_tot), piv_pool_cap(S_tot)
         , sim_thresh(0.75f), replace_thresh(0.5f), score_thresh(0.2f)
         , overflow_max(OVERFLOW_MAX_CAP)
-        , dtype(DType::Float16) {}
+        , dtype(DType::Float16)
+        , piv_num_zones(512), piv_zone_cap(0) {}
     
     // Compute S_tot from H and V_alloc
     void update_derived() {
@@ -582,6 +594,12 @@ struct SegPoolViews {
     int64_t seg_buf_cap;
     int64_t seg_piv_cap;
 
+    // Pivot zone allocator (Morton-based spatial locality)
+    int32_t* voxel_zone_map;    // [V_alloc] voxel_id -> zone_id, nullptr if disabled
+    int32_t* piv_zone_top;      // [Z] per-zone atomic stack tops, nullptr if disabled
+    int32_t  piv_num_zones;     // Z
+    int32_t  piv_zone_cap;      // segments per zone
+
     SegPoolViews() {
         seg_buf_K = seg_buf_V = nullptr;
         seg_buf_S = nullptr;
@@ -596,6 +614,10 @@ struct SegPoolViews {
         piv_row_state = nullptr;
         seg_piv_free_stack = seg_piv_free_top = nullptr;
         seg_buf_cap = seg_piv_cap = 0;
+        voxel_zone_map = nullptr;
+        piv_zone_top = nullptr;
+        piv_num_zones = 0;
+        piv_zone_cap = 0;
     }
 };
 

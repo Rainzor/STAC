@@ -5,7 +5,7 @@ import warnings
 import numpy as np
 from .h2o import HeavyHittersKV
 from .flash_attn_triton import fa_forward_colsum_fast
-from .voxel import BinaryVoxel,HashVoxel
+from .voxel import BinaryVoxel
 from .merger import VoxelKVMerger, _MEM_PROFILE, _gpu_mem_mb, _tensor_mb
 
 
@@ -55,8 +55,6 @@ class STACVoxelKV(HeavyHittersKV):
         # ---- 配置缓存 ----
         self._voxel_size = torch.tensor(voxel_size, dtype=torch.float32, device=self.device)
         self._vm = BinaryVoxel(voxel_size=voxel_size, device=self.device)
-        # self._vm = BinaryVoxelFast(voxel_size=voxel_size, device=self.device)
-        # self._vm = HashVoxel(voxel_size=voxel_size, device=self.device)
         self._voxel_ids = set()
         self._recent_voxel_ids = None
 
@@ -493,6 +491,9 @@ class STACVoxelKV(HeavyHittersKV):
             torch.cuda.synchronize()
             a_pre, r_pre = _gpu_mem_mb()
 
+        if hasattr(self._vm, '_voxel_zones') and self._vm._voxel_zones.numel() > 0:
+            self._vstore.update_voxel_zones(self._vm._voxel_zones)
+
         insert_merge_time = self._vstore.insert_and_merge(
             K_new=K_drop.view(L*H, T_d, D),
             V_new=V_drop.view(L*H, T_d, D),
@@ -685,6 +686,8 @@ class STACVoxelKV(HeavyHittersKV):
         #TODO: consider filter low-score or low-count tokens before insert
         vstore = self._vstores[slot_idx]
         num_voxels = self._vm.get_voxel_keys().shape[0]  # 当前有效 voxel 数
+        if hasattr(self._vm, '_voxel_zones') and self._vm._voxel_zones.numel() > 0:
+            vstore.update_voxel_zones(self._vm._voxel_zones)
         insert_merge_time = vstore.insert_and_merge(K_new=K_drop, V_new=V_drop, 
                                 S_new=S_drop, I_new=I_drop, VX_new= VX_drop,
                                 num_voxels=num_voxels,

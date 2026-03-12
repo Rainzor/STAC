@@ -28,6 +28,55 @@ __global__ void zero_scalar_kernel(int32_t* ptr) {
 }
 
 // =============================================================================
+// Pivot zone allocator helpers (Morton-based spatial locality)
+// =============================================================================
+
+__device__ int32_t zone_alloc_piv(
+    int32_t* __restrict__ piv_free_stack,
+    int32_t* __restrict__ zone_tops,
+    int32_t zone_cap,
+    int32_t num_zones,
+    int32_t target_zone,
+    int32_t* out_spill_dist = nullptr)
+{
+    int32_t base = target_zone * zone_cap;
+    int32_t top = atomicSub(&zone_tops[target_zone], 1) - 1;
+    if (top >= 0) {
+        if (out_spill_dist) *out_spill_dist = 0;
+        return piv_free_stack[base + top];
+    }
+    atomicAdd(&zone_tops[target_zone], 1);
+
+    for (int d = 1; d < num_zones; d++) {
+        for (int sign = 0; sign < 2; sign++) {
+            int z = target_zone + (sign == 0 ? d : -d);
+            if (z < 0 || z >= num_zones) continue;
+            int32_t b = z * zone_cap;
+            top = atomicSub(&zone_tops[z], 1) - 1;
+            if (top >= 0) {
+                if (out_spill_dist) *out_spill_dist = d;
+                return piv_free_stack[b + top];
+            }
+            atomicAdd(&zone_tops[z], 1);
+        }
+    }
+    if (out_spill_dist) *out_spill_dist = -1;
+    return -1;
+}
+
+__device__ void zone_free_piv(
+    int32_t* __restrict__ piv_free_stack,
+    int32_t* __restrict__ zone_tops,
+    int32_t zone_cap,
+    int32_t sid)
+{
+    int32_t z = sid / zone_cap;
+    int32_t base = z * zone_cap;
+    int32_t top = atomicAdd(&zone_tops[z], 1);
+    piv_free_stack[base + top] = sid;
+}
+
+// =============================================================================
 // Pack Valid Tokens
 // =============================================================================
 template <typename scalar_t>
@@ -2817,6 +2866,12 @@ __global__ void remerge_fused_seg_kernel(
     int32_t* __restrict__ seg_piv_free_stack,
     int32_t* __restrict__ seg_piv_free_top,
     int P, int D, int64_t S_tot,
+    // Pivot zone allocator params (nullptr to use global stack fallback)
+    const int32_t* __restrict__ voxel_zone_map,
+    int32_t* __restrict__ piv_zone_top,
+    int32_t piv_zone_cap,
+    int32_t piv_num_zones,
+    int64_t V_alloc,
     int32_t* __restrict__ diag)
 {
     const int pi = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
@@ -2919,15 +2974,36 @@ __global__ void remerge_fused_seg_kernel(
         // Reuse victim's segment directly (no free-stack round-trip needed)
         if (lane == 0) {
             piv_row_seg[piv_seg_base + j_victim] = -1;
+            if (diag) atomicAdd(&diag[DIAG_ZONE_ALLOC_VICTIM_REUSE], 1);
         }
         ws = j_victim;
         new_sid = v_sid;
     } else {
-        // Free slot available — allocate new segment from free stack
+        // Free slot available — allocate new segment
         if (lane == 0) {
-            int32_t top = atomicSub(seg_piv_free_top, 1) - 1;
-            if (top < 0) { atomicAdd(seg_piv_free_top, 1); }
-            else { new_sid = seg_piv_free_stack[top]; }
+            if (voxel_zone_map && piv_zone_top && piv_num_zones > 0) {
+                int64_t voxel_id = row % V_alloc;
+                int32_t zone = voxel_zone_map[voxel_id];
+                int32_t spill_dist = 0;
+                new_sid = zone_alloc_piv(seg_piv_free_stack, piv_zone_top,
+                                         piv_zone_cap, piv_num_zones, zone,
+                                         diag ? &spill_dist : nullptr);
+                if (diag) {
+                    atomicAdd(&diag[DIAG_ZONE_ALLOC_TOTAL], 1);
+                    if (new_sid < 0) {
+                        atomicAdd(&diag[DIAG_ZONE_ALLOC_EXHAUSTED], 1);
+                    } else if (spill_dist == 0) {
+                        atomicAdd(&diag[DIAG_ZONE_ALLOC_HIT], 1);
+                    } else {
+                        atomicAdd(&diag[DIAG_ZONE_ALLOC_SPILL], 1);
+                        atomicAdd(&diag[DIAG_ZONE_ALLOC_SPILL_DIST], spill_dist);
+                    }
+                }
+            } else {
+                int32_t top = atomicSub(seg_piv_free_top, 1) - 1;
+                if (top < 0) { atomicAdd(seg_piv_free_top, 1); }
+                else { new_sid = seg_piv_free_stack[top]; }
+            }
         }
         new_sid = __shfl_sync(FULL_MASK, new_sid, 0);
     }
@@ -3053,7 +3129,10 @@ void remerge_fused_seg(
     int32_t* piv_row_seg, int8_t* piv_row_state, int32_t* piv_row_count,
     int32_t* seg_piv_free_stack, int32_t* seg_piv_free_top,
     int64_t P, int64_t D, int64_t G_max, int64_t S_tot,
-    DType dtype, cudaStream_t stream, int32_t* diag)
+    DType dtype, cudaStream_t stream,
+    const int32_t* voxel_zone_map, int32_t* piv_zone_top,
+    int32_t piv_zone_cap, int32_t piv_num_zones, int64_t V_alloc,
+    int32_t* diag)
 {
     if (G_max == 0) return;
     const int total_threads = G_max * WARP_SIZE;
@@ -3069,7 +3148,9 @@ void remerge_fused_seg(
             (__half*)seg_piv_K_seed, seg_piv_S_seed,
             piv_row_seg, piv_row_state, piv_row_count,
             seg_piv_free_stack, seg_piv_free_top,
-            P, D, S_tot, diag);
+            P, D, S_tot,
+            voxel_zone_map, piv_zone_top, piv_zone_cap, piv_num_zones, V_alloc,
+            diag);
     } else {
         remerge_fused_seg_kernel<__nv_bfloat16><<<blocks, tpb, 0, stream>>>(
             (const __nv_bfloat16*)new_piv_K, (const __nv_bfloat16*)new_piv_V,
@@ -3080,7 +3161,9 @@ void remerge_fused_seg(
             (__nv_bfloat16*)seg_piv_K_seed, seg_piv_S_seed,
             piv_row_seg, piv_row_state, piv_row_count,
             seg_piv_free_stack, seg_piv_free_top,
-            P, D, S_tot, diag);
+            P, D, S_tot,
+            voxel_zone_map, piv_zone_top, piv_zone_cap, piv_num_zones, V_alloc,
+            diag);
     }
 }
 

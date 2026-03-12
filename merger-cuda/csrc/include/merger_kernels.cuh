@@ -789,6 +789,11 @@ void remerge_fused_seg(
     int64_t S_tot,
     DType dtype,
     cudaStream_t stream,
+    const int32_t* voxel_zone_map = nullptr,
+    int32_t* piv_zone_top = nullptr,
+    int32_t piv_zone_cap = 0,
+    int32_t piv_num_zones = 0,
+    int64_t V_alloc = 0,
     int32_t* diag = nullptr);
 
 void retrieve_fixed_seg(

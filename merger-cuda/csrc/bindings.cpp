@@ -214,6 +214,9 @@ PYBIND11_MODULE(_ext, m) {
              "Enable or disable segmented pool storage mode.",
              py::arg("enabled"))
         .def_property_readonly("is_seg_mode", &causalvggt::MergerWrapper::is_seg_mode)
+        .def("set_voxel_zones", &causalvggt::MergerWrapper::set_voxel_zones,
+             "Set voxel-to-zone mapping for Morton-aware pivot allocation.",
+             py::arg("zones"))
         .def("insert_and_merge_with_rows_seg", &causalvggt::MergerWrapper::insert_and_merge_with_rows_seg,
              R"doc(
              Segmented-pool variant of insert_and_merge_with_rows.
