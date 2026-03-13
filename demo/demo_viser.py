@@ -26,10 +26,10 @@ except ImportError:
 root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(root_dir, "src"))
 from visual_util import segment_sky, download_file_from_url
-from vggt.models.vggt import VGGT
-from vggt.utils.load_fn import load_and_preprocess_images
-from vggt.utils.geometry import closed_form_inverse_se3, unproject_depth_map_to_point_map
-from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from causalvggt.utils.load_fn import load_and_preprocess_images
+from causalvggt.utils.geometry import closed_form_inverse_se3, unproject_depth_map_to_point_map
+from causalvggt.utils.pose_enc import pose_encoding_to_extri_intri
+from model_wrapper import load_model
 
 
 def viser_wrapper(
@@ -384,19 +384,11 @@ def main():
             predictions["extrinsic"] = extrinsic
             predictions["intrinsic"] = intrinsic
     else:
-        print("Initializing and loading VGGT model...")
-        # model = VGGT.from_pretrained("facebook/VGGT-1B")
+        print("Initializing and loading CausalVGGT model...")
+        model = load_model("causalvggt", base_model="stream3r", device=device)
 
-        model = VGGT()
-        _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-        model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
-
-        model.eval()
-        model = model.to(device)
-
-        # Use the provided image folder path
         print(f"Loading images from {args.image_folder}...")
-        image_names = glob.glob(os.path.join(args.image_folder, "*"))
+        image_names = sorted(glob.glob(os.path.join(args.image_folder, "*")))
         print(f"Found {len(image_names)} images")
 
         images = load_and_preprocess_images(image_names).to(device)
@@ -406,7 +398,7 @@ def main():
         dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
         with torch.no_grad():
-            with torch.cuda.amp.autocast(dtype=dtype):
+            with torch.amp.autocast(device_type="cuda", dtype=dtype):
                 predictions = model(images)
 
         print("Converting pose encoding to extrinsic and intrinsic matrices...")

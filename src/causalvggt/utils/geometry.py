@@ -9,11 +9,7 @@ import torch
 import numpy as np
 
 
-try:
-    from vggt.dependency.distortion import apply_distortion, iterative_undistortion, single_undistortion
-    _DISTORTION_AVAILABLE = True
-except ImportError:
-    _DISTORTION_AVAILABLE = False
+_DISTORTION_AVAILABLE = False
 
 
 def unproject_depth_map_to_point_map(

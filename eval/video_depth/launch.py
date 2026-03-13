@@ -101,8 +101,8 @@ def get_args_parser():
         default=None,
         help="list of sequences for pose evaluation",
     )
-    parser.add_argument("--model_name", type=str, default="vggt")
-    parser.add_argument("--base_model", type=str, default="vggt", choices=["vggt", "stream3r","streamvggt"], help="Base model for CausalVGGT")
+    parser.add_argument("--model_name", type=str, default="causalvggt")
+    parser.add_argument("--base_model", type=str, default="stream3r", choices=["stream3r", "streamvggt"], help="Base model for CausalVGGT")
 
     parser.add_argument("--mode", type=str, default="full",
                         help="Processing mode")

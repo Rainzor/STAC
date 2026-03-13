@@ -12,9 +12,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vggt.layers import Mlp
+from causalvggt.layers import Mlp
 from causalvggt.layers.block import Block, create_attn_mask
-from vggt.heads.head_act import activate_pose
+from causalvggt.heads.head_act import activate_pose
 from causalvggt.layers.attention import SparseAttention
 
 class CameraHead(nn.Module):

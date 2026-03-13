@@ -53,7 +53,7 @@ def get_args_parser():
     # model
     parser.add_argument("--model_name", type=str, default="causalvggt")
     parser.add_argument("--base_model", type=str, default="stream3r",
-                        choices=["vggt", "stream3r", "streamvggt"],
+                        choices=["stream3r", "streamvggt"],
                         help="Base model for CausalVGGT")
 
     # output

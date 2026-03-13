@@ -13,17 +13,19 @@
 
 ---
 
+
 | Capability         | Full Attention | Causal / Window   | **STAC (Ours)**           |
 | ------------------ | -------------- | ----------------- | ------------------------- |
 | Attention          | All frames     | Sliding window    | Window + voxel retrieval  |
 | Memory scaling     | O(N²)          | O(W) fixed window | O(W) + bounded voxel pool |
 | Long-video support | ✗ (OOM)        | ✓ (no history)    | ✓ (with spatial memory)   |
 
-**Supported backbones** (switch via `--base_model`): [STream3R](https://github.com/NIRVANALAN/STream3R) (`stream3r`) · [StreamVGGT](https://github.com/wzzheng/StreamVGGT) (`streamvggt`) · [VGGT](https://github.com/facebookresearch/vggt) (`vggt`)
+
+**Supported backbones** (switch via `--base_model`): [STream3R](https://github.com/NIRVANALAN/STream3R) (`stream3r`) · [StreamVGGT](https://github.com/wzzheng/StreamVGGT) (`streamvggt`)
 
 ## Overview
 
-Feed-forward 3D models ([VGGT](https://github.com/facebookresearch/vggt), [STream3R](https://github.com/NIRVANALAN/STream3R), [StreamVGGT](https://github.com/wzzheng/StreamVGGT)) scale poorly on long videos (O(N²) memory); sliding-window attention avoids OOM but loses history. **STAC** merges evicted tokens into a 3D voxel pool by world coordinates and retrieves the most relevant *pivot* tokens at each step, keeping long-range spatial memory with bounded memory and compute.
+Feed-forward 3D models ([STream3R](https://github.com/NIRVANALAN/STream3R), [StreamVGGT](https://github.com/wzzheng/StreamVGGT)) scale poorly on long videos (O(N²) memory); sliding-window attention avoids OOM but loses history. **STAC** merges evicted tokens into a 3D voxel pool by world coordinates and retrieves the most relevant *pivot* tokens at each step, keeping long-range spatial memory with bounded memory and compute.
 
 ### Key features
 
@@ -40,9 +42,9 @@ Feed-forward 3D models ([VGGT](https://github.com/facebookresearch/vggt), [STrea
 ┌─────────────────────────────────────────────────────┐
 │  Backbone (interchangeable)                         │
 │  ┌───────────┐  ┌───────────┐  ┌────────────────┐  │
-│  │ STream3R  │  │StreamVGGT │  │ VGGT / others  │  │
-│  └─────┬─────┘  └─────┬─────┘  └───────┬────────┘  │
-│        └───────────────┼────────────────┘           │
+│  │ STream3R  │  │StreamVGGT │  │  (others)  │       │
+│  └─────┬─────┘  └─────┬─────┘  └─────┬────┘        │
+│        └───────────────┼──────────────┘             │
 │                        ▼                            │
 │              CausalVGGT Adapter                     │
 │        (src/causalvggt/models/vggt.py)              │
@@ -73,11 +75,12 @@ Feed-forward 3D models ([VGGT](https://github.com/facebookresearch/vggt), [STrea
 
 ### Attention modes
 
-| Mode                   | Streaming | Description                                      |
-| ---------------------- | --------- | ------------------------------------------------ |
-| `full`                 | No        | Full attention (memory ∝ N²)                     |
-| `causal` / `window_kv` | Yes       | Sliding window KV cache                          |
-| `window_chunk_merge`   | Yes       | Chunked window + voxel merge (**recommended**)   |
+
+| Mode                   | Streaming | Description                                    |
+| ---------------------- | --------- | ---------------------------------------------- |
+| `full`                 | No        | Full attention (memory ∝ N²)                   |
+| `causal` / `window_kv` | Yes       | Sliding window KV cache                        |
+| `window_chunk_merge`   | Yes       | Chunked window + voxel merge (**recommended**) |
 
 
 ## Installation
@@ -105,17 +108,18 @@ pip install -e merger-cuda --no-build-isolation
 
 ### Checkpoints
 
-Place backbone weights under `ckpt/{stream3r|streamvggt|vggt}/` as `model.safetensors` or `model.pt` (auto-detected).
+Place backbone weights under `ckpt/{stream3r|streamvggt}/` as `model.safetensors` or `model.pt` (auto-detected).
 
-| Backbone   | Hugging Face |
-| ---------- | -------------|
+
+| Backbone   | Hugging Face                                                      |
+| ---------- | ----------------------------------------------------------------- |
 | STream3R   | [yslan/STream3R](https://huggingface.co/yslan/STream3R) (default) |
-| StreamVGGT | [lch01/StreamVGGT](https://huggingface.co/lch01/StreamVGGT) |
-| VGGT       | [facebook/VGGT-1B](https://huggingface.co/facebook/VGGT-1B) |
+| StreamVGGT | [lch01/StreamVGGT](https://huggingface.co/lch01/StreamVGGT)       |
+
 
 ```bash
 mkdir -p ckpt/stream3r && hf download yslan/STream3R --local-dir ckpt/stream3r
-# Similarly for streamvggt, vggt. Use HF_ENDPOINT=https://hf-mirror.com for mirrors.
+# Similarly for streamvggt. Use HF_ENDPOINT=https://hf-mirror.com for mirrors.
 ```
 
 ## Quick Start
@@ -133,7 +137,7 @@ from model_wrapper import load_model, run_model
 
 device = "cuda"
 
-# Pick any supported backbone: "stream3r", "streamvggt", or "vggt"
+# Pick any supported backbone: "stream3r" or "streamvggt"
 model = load_model("causalvggt", base_model="stream3r", device=device)
 
 # images: (N, 3, H, W) tensor, pixel values in [0, 1]
@@ -156,9 +160,6 @@ Switching backbones is a one-line change:
 ```python
 # Use StreamVGGT backbone instead
 model = load_model("causalvggt", base_model="streamvggt", device=device)
-
-# Use VGGT backbone instead
-model = load_model("causalvggt", base_model="vggt", device=device)
 ```
 
 ### Command line
@@ -179,11 +180,13 @@ Put datasets under `data/` (symlinks OK): `7scenes/`, `neural_rgbd/`, `DTU/`, `t
 
 Use `--base_model` to switch backbones. Batch run:
 
-| Task              | Batch script | Single-run entry |
-| ----------------- | ------------ | ----------------- |
-| 3D reconstruction | `bash eval/long_recon/run.sh` | `eval/long_recon/launch.py` (e.g. `--dataset_type NRGBD`) |
-| Camera pose       | `bash eval/cam_pose/run.sh`    | `eval/cam_pose/launch.py` (e.g. `--dataset_type tum`) |
-| Video depth       | `bash eval/video_depth/run.sh` | `eval/video_depth/launch.py` then `eval/video_depth/eval_depth.py --align scale` |
+
+| Task              | Batch script                   | Single-run entry                                                               |
+| ----------------- | ------------------------------ | ------------------------------------------------------------------------------ |
+| 3D reconstruction | `bash eval/long_recon/run.sh`  | `eval/long_recon/launch.py` (e.g. `--dataset_type NRGBD`)                      |
+| Camera pose       | `bash eval/cam_pose/run.sh`    | `eval/cam_pose/launch.py` (e.g. `--dataset_type tum`)                          |
+| Video depth       | `bash eval/video_depth/run.sh` | `eval/video_depth/launch.py` && `eval/video_depth/eval_depth.py --align scale` |
+
 
 Common flags: `--model_name causalvggt --base_model stream3r --mode window_chunk_merge --streaming -win 4 -ck 4 -hh 2 -ret_sz 2 -ret_buf`. Eval scripts default to `--voxel_backend cuda` and `--allocator segment`.
 
@@ -195,43 +198,46 @@ Common flags: `--model_name causalvggt --base_model stream3r --mode window_chunk
 
 ## Key arguments
 
-| Argument | Short | Default | Description |
-| -------- | ----- | ------- | ----------- |
-| `--model_name` | | `causalvggt` | Model variant |
-| `--base_model` | | `stream3r` | Backbone: `stream3r`, `streamvggt`, `vggt` |
-| `--mode` | | `full` | Attention mode ([table](#attention-modes)) |
-| `--streaming` | | off | Frame-by-frame via StreamSession |
-| `--window_size` | `-win` | 0 | Sliding KV window (frames) |
-| `--chunk_size` | `-ck` | 1 | Frames per forward pass |
-| `--hh_size` | `-hh` | 0 | Heavy-hitter frames (H2O) |
-| `--retrieval_size` | `-ret_sz` | 0 | Voxel pivots per step; `-1` = all |
-| `--retrieve_buf` | `-ret_buf` | off | Include retrieved pivots in buffer (API: `return_buf=True`) |
-| `--pinned` | | 0 | Frame indices pinned in KV cache |
-| `--voxel_size` | | 0.05 | Voxel grid resolution (m) |
-| `--voxel_num` | | 4096 | Initial voxel pool size |
-| `--voxel_buf_cap` | | 8 | Max KV entries per buffer voxel |
-| `--voxel_piv_cap` | | 4 | Max KV entries per pivot voxel |
-| `--voxel_backend` | | cuda (eval) | `python` or `cuda`; eval scripts default to `cuda` |
-| `--allocator` | `-alloc` | segment (eval) | `static`, `slab`, `segment`; eval scripts default to `segment` |
-| `--temperature` | | 0.9 | H2O score temperature |
-| `--size` | | 518 | Input resolution |
-| `--kf_every` | | 1 | Process every N-th frame |
+
+| Argument           | Short      | Default        | Description                                                    |
+| ------------------ | ---------- | -------------- | -------------------------------------------------------------- |
+| `--model_name`     |            | `causalvggt`   | Model variant                                                  |
+| `--base_model`     |            | `stream3r`     | Backbone: `stream3r`, `streamvggt`                             |
+| `--mode`           |            | `full`         | Attention mode ([table](#attention-modes))                     |
+| `--streaming`      |            | off            | Frame-by-frame via StreamSession                               |
+| `--window_size`    | `-win`     | 0              | Sliding KV window (frames)                                     |
+| `--chunk_size`     | `-ck`      | 1              | Frames per forward pass                                        |
+| `--hh_size`        | `-hh`      | 0              | Heavy-hitter frames (H2O)                                      |
+| `--retrieval_size` | `-ret_sz`  | 0              | Voxel pivots per step; `-1` = all                              |
+| `--retrieve_buf`   | `-ret_buf` | off            | Include retrieved pivots in buffer (API: `return_buf=True`)    |
+| `--pinned`         |            | 0              | Frame indices pinned in KV cache                               |
+| `--voxel_size`     |            | 0.05           | Voxel grid resolution (m)                                      |
+| `--voxel_num`      |            | 4096           | Initial voxel pool size                                        |
+| `--voxel_buf_cap`  |            | 8              | Max KV entries per buffer voxel                                |
+| `--voxel_piv_cap`  |            | 4              | Max KV entries per pivot voxel                                 |
+| `--voxel_backend`  |            | cuda (eval)    | `python` or `cuda`; eval scripts default to `cuda`             |
+| `--allocator`      | `-alloc`   | segment (eval) | `static`, `slab`, `segment`; eval scripts default to `segment` |
+| `--temperature`    |            | 0.9            | H2O score temperature                                          |
+| `--size`           |            | 518            | Input resolution                                               |
+| `--kf_every`       |            | 1              | Process every N-th frame                                       |
+
 
 **Env:** `VERBOSE=1` — per-frame KV stats; `MERGER_MEM_PROFILE=1` — CUDA memory fragmentation at cleanup.
 
 ## Project structure
 
-| Path | Role |
-| ---- | ---- |
-| `main.py` | Legacy CLI; prefer eval scripts for full STAC |
-| `src/model_wrapper.py` | Unified `load_model` / `run_model` for all backbones |
-| `src/stream_session.py` | Frame-by-frame streaming and prediction accumulation |
-| `src/causalvggt/` | CausalVGGT adapter: models, SparseAttention, heads |
-| `src/stac/` | KV manager, H2O, voxel merge/retrieval, merger, allocator, Triton flash attn |
-| `src/vggt/` | Upstream VGGT reference |
-| `eval/long_recon/`, `cam_pose/`, `video_depth/` | 3D recon, pose, depth |
-| `demo/` | Gradio app, Viser, COLMAP |
-| `merger-cuda/` | Optional CUDA KV merger extension |
+
+| Path                                            | Role                                                                         |
+| ----------------------------------------------- | ---------------------------------------------------------------------------- |
+| `main.py`                                       | Legacy CLI; prefer eval scripts for full STAC                                |
+| `src/model_wrapper.py`                          | Unified `load_model` / `run_model` for all backbones                         |
+| `src/stream_session.py`                         | Frame-by-frame streaming and prediction accumulation                         |
+| `src/causalvggt/`                               | CausalVGGT adapter: models, SparseAttention, heads                           |
+| `src/stac/`                                     | KV manager, H2O, voxel merge/retrieval, merger, allocator, Triton flash attn |
+| `eval/long_recon/`, `cam_pose/`, `video_depth/` | 3D recon, pose, depth                                                        |
+| `demo/`                                         | Gradio app, Viser, COLMAP                                                    |
+| `merger-cuda/`                                  | CUDA KV merger extension                                                     |
+
 
 ## Citation
 

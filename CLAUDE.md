@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-STAC (Sparse Token Attention Cache) is a plug-and-play KV-cache management module for memory-efficient streaming 3D reconstruction over long video sequences. It compresses evicted KV-cache tokens into a 3D voxel pool and retrieves them on demand, compatible with any causal vision transformer backbone (STream3R, StreamVGGT, VGGT).
+STAC (Sparse Token Attention Cache) is a plug-and-play KV-cache management module for memory-efficient streaming 3D reconstruction over long video sequences. It compresses evicted KV-cache tokens into a 3D voxel pool and retrieves them on demand, compatible with any causal vision transformer backbone (STream3R, StreamVGGT).
 
 ## Setup
 
@@ -19,7 +19,7 @@ export CUDA_HOME=/usr/local/cuda-12.8
 pip install -e merger-cuda --no-build-isolation
 ```
 
-Checkpoints go under `ckpt/{stream3r,streamvggt,vggt}/` as `model.safetensors` or `model.pt` (auto-detected by `model_wrapper`).
+Checkpoints go under `ckpt/{stream3r,streamvggt}/` as `model.safetensors` or `model.pt` (auto-detected by `model_wrapper`).
 
 ## Common Commands
 
@@ -63,7 +63,7 @@ python demo/demo_colmap.py --scene_dir /path/to/scene --output_dir output/colmap
 
 ### Two entry points
 
-- **`main.py`** — Legacy standalone CLI. Uses `stream3r` / `vggt` / `streamvggt` / `sparsevggt` only (no causalvggt); imports from `stream3r.stream_session` and backbone packages. For STAC + causalvggt use eval scripts or the Python API (see README).
+- **`main.py`** — Legacy standalone CLI (may not work after vggt removal). Uses `stream3r` / `streamvggt` / `sparsevggt` only (no causalvggt); imports from `stream3r.stream_session` and backbone packages. For STAC + causalvggt use eval scripts or the Python API (see README).
 - **`src/model_wrapper.py`** — Unified `load_model(model_name, base_model)` / `run_model()` API used by evaluation scripts. Supports `model_name=causalvggt` with `StreamSession` from `src/stream_session.py` for streaming.
 
 ### Core components (`src/`)
@@ -85,8 +85,6 @@ python demo/demo_colmap.py --scene_dir /path/to/scene --output_dir output/colmap
   - `merger.py` — `VoxelKVMerger` handles KV merge into voxels with slab/segment allocators
   - `allocator.py` — Slab and segment memory allocators for voxel pool
   - `flash_attn_triton.py` — Triton kernels for flash attention with column-sum scoring
-
-- **`src/vggt/`** — Original upstream VGGT reference implementation (read-only reference)
 
 ### Inheritance chain for KV managers
 

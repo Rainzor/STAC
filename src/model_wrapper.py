@@ -1,6 +1,4 @@
 import os
-import sys
-from copy import deepcopy
 
 import torch
 import logging
@@ -14,24 +12,15 @@ logger = logging.getLogger("model wrapper")
 from stream_session import StreamSession
 from causalvggt.models.vggt import CausalVGGT
 
-# Optional imports for other model types
-try:
-    from vggt.models.vggt import VGGT
-except ImportError:
-    VGGT = None
-    logger.debug("vggt.models.vggt not available")
-
 ckpt_root = os.path.join(root_dir, 'ckpt')
 
 model_paths = {
-    "vggt": os.path.join(ckpt_root, 'vggt'),
     "stream3r": os.path.join(ckpt_root, 'stream3r'),
     "streamvggt": os.path.join(ckpt_root, 'streamvggt'),
 }
 
 model_wrappers = {
-    "vggt": VGGT,
-    "causalvggt": CausalVGGT
+    "causalvggt": CausalVGGT,
 }
 
 stream_sessions = {
@@ -63,18 +52,16 @@ def _safe_load_state_dict(model, ckpt):
         logger.info(f"Skipped {len(result.unexpected_keys)} extra checkpoint keys "
                      f"(unused heads): {result.unexpected_keys[:5]}{'...' if len(result.unexpected_keys) > 5 else ''}")
 
-def load_model(model_name, base_model='vggt', device='cuda'):
+def load_model(model_name, base_model='stream3r', device='cuda'):
+    if model_name != "causalvggt":
+        raise ValueError(f"Unsupported model_name '{model_name}'. Only 'causalvggt' is supported.")
+    if base_model not in model_paths:
+        raise ValueError(f"Unsupported base_model '{base_model}'. Choose from: {list(model_paths.keys())}")
 
-    if model_name == "causalvggt":
-        model = model_wrappers[model_name](base_model=base_model)
-        ckpt_dir = model_paths[base_model]
-        ckpt = _load_checkpoint(ckpt_dir)
-        _safe_load_state_dict(model, ckpt)
-    else:
-        model = model_wrappers[model_name]()
-        ckpt_dir = model_paths[model_name]
-        ckpt = _load_checkpoint(ckpt_dir)
-        _safe_load_state_dict(model, ckpt)
+    model = model_wrappers[model_name](base_model=base_model)
+    ckpt_dir = model_paths[base_model]
+    ckpt = _load_checkpoint(ckpt_dir)
+    _safe_load_state_dict(model, ckpt)
     model.eval()
     model = model.to(device)
 
@@ -84,62 +71,49 @@ def run_model(model, images, model_name, mode='full',
               streaming=False, dtype=torch.bfloat16, device='cuda', 
               **kwargs
               ):
-    if model_name == "vggt":
-        if streaming or mode != "full":
-            logger.warning(
-                "Warning: VGGT only supports 'full' attention mode without streaming. Switching to 'full' mode."
-            )
-        streaming = False
-        mode = "full"
-        predictions = model(images)
-    elif model_name == "causalvggt":
-        processed_frames = images.shape[0]
-        if streaming:
-            logger.info("Using streaming mode for CausalVGGT.")
-            if mode == "full":
-                logger.warning("Warning: you are trying to use 'full' attention mode with streaming, which will cause high memory usage.")
-            cam_cache_update = kwargs.get("cam_cache_update", True)
-            kwargs.pop("cam_cache_update", None)
-            session:StreamSession = stream_sessions[model_name](
-                                                        model,
-                                                        device=device,
-                                                        cam_cache_update=cam_cache_update)
-            
-            session.pipeline(images, mode=mode,
-                             dtype=dtype, device=device,
-                             **kwargs)
-            predictions = session.get_all_predictions()
-            benchmark_metrics = session.get_benchmark()
-            total_time = 0
-            for k in benchmark_metrics:
-                benchmark_metrics[k] = benchmark_metrics[k] / processed_frames
-                total_time += benchmark_metrics[k]
-                logger.info(f" Average {k} time per frame: {benchmark_metrics[k]:.2f}ms")
-            logger.info(f"🧭 Total average time per frame: {total_time:.2f}ms, FPS: {1000/total_time:.1f} ")
-            benchmark_metrics["infer_fps"] = 1000.0 / total_time if total_time > 0 else 0
-            predictions["timing"] = benchmark_metrics
+    if model_name != "causalvggt":
+        raise NotImplementedError(f"Model '{model_name}' not supported. Only 'causalvggt' is supported.")
 
-            predictions["merger"] = session.get_stats()
+    processed_frames = images.shape[0]
+    if streaming:
+        logger.info("Using streaming mode for CausalVGGT.")
+        if mode == "full":
+            logger.warning("Warning: you are trying to use 'full' attention mode with streaming, which will cause high memory usage.")
+        cam_cache_update = kwargs.get("cam_cache_update", True)
+        kwargs.pop("cam_cache_update", None)
+        session: StreamSession = stream_sessions[model_name](
+            model, device=device, cam_cache_update=cam_cache_update)
 
-            session.clear()
-        else:
-            # Use batch processing (non-streaming inference)
-            predictions = model(images, 
-                                mode=mode, 
-                                streaming=False, 
-                                **kwargs)
-            benchmark_metrics = predictions.get("timing", {})
-            total_time = 0
-            for k in benchmark_metrics:
-                benchmark_metrics[k] = benchmark_metrics[k] / processed_frames
-                total_time += benchmark_metrics[k]
-                logger.info(f" Average {k} time per frame: {benchmark_metrics[k]:.2f}ms")
-            logger.info(f"🧭 Total average time per frame: {total_time:.2f}ms, FPS: {1000/total_time:.1f} ")
-            benchmark_metrics["infer_fps"] = 1000.0 / total_time if total_time > 0 else 0
-            predictions["timing"] = benchmark_metrics
+        session.pipeline(images, mode=mode,
+                         dtype=dtype, device=device,
+                         **kwargs)
+        predictions = session.get_all_predictions()
+        benchmark_metrics = session.get_benchmark()
+        total_time = 0
+        for k in benchmark_metrics:
+            benchmark_metrics[k] = benchmark_metrics[k] / processed_frames
+            total_time += benchmark_metrics[k]
+            logger.info(f" Average {k} time per frame: {benchmark_metrics[k]:.2f}ms")
+        logger.info(f"Total average time per frame: {total_time:.2f}ms, FPS: {1000/total_time:.1f} ")
+        benchmark_metrics["infer_fps"] = 1000.0 / total_time if total_time > 0 else 0
+        predictions["timing"] = benchmark_metrics
+        predictions["merger"] = session.get_stats()
+        session.clear()
     else:
-        raise NotImplementedError(f"Model {model_name} not implemented")
-    
+        predictions = model(images,
+                            mode=mode,
+                            streaming=False,
+                            **kwargs)
+        benchmark_metrics = predictions.get("timing", {})
+        total_time = 0
+        for k in benchmark_metrics:
+            benchmark_metrics[k] = benchmark_metrics[k] / processed_frames
+            total_time += benchmark_metrics[k]
+            logger.info(f" Average {k} time per frame: {benchmark_metrics[k]:.2f}ms")
+        logger.info(f"Total average time per frame: {total_time:.2f}ms, FPS: {1000/total_time:.1f} ")
+        benchmark_metrics["infer_fps"] = 1000.0 / total_time if total_time > 0 else 0
+        predictions["timing"] = benchmark_metrics
+
     predictions["mode"] = mode
     predictions["streaming"] = streaming
 

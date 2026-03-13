@@ -58,10 +58,10 @@ if torch.cuda.is_available():
     torch.cuda.reset_peak_memory_stats()
 
 def get_args_parser():
-    parser = argparse.ArgumentParser("Evaluation of VGGT and its variants",
+    parser = argparse.ArgumentParser("Evaluation of CausalVGGT",
                                      add_help=False)
-    parser.add_argument("--model_name", type=str, default="vggt")
-    parser.add_argument("--base_model", type=str, default="vggt", choices=["vggt", "stream3r","streamvggt"], help="Base model for CausalVGGT")
+    parser.add_argument("--model_name", type=str, default="causalvggt")
+    parser.add_argument("--base_model", type=str, default="stream3r", choices=["stream3r", "streamvggt"], help="Base model for CausalVGGT")
     parser.add_argument("--voxel_conf",
                         type=float,
                         default=2.0,
@@ -431,7 +431,7 @@ def main(args):
 
 
 
-            if args.model_name in ["stream3r", "vggt", "streamvggt", "causalvggt"]:
+            if args.model_name in ["causalvggt"]:
                 logger.info(f"📌 Running inference on {args.model_name} for scene {scene_name} ")
 
                 #! Start of Inference
