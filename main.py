@@ -9,8 +9,6 @@ The scene directory should contain an `images/` subfolder with .png or .jpg file
 Checkpoints should be placed under ckpt/{stream3r,streamvggt}/ (see README.md).
 """
 
-import os
-import sys
 import re
 import argparse
 import logging
@@ -18,9 +16,6 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-
-root_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(root_dir, "src"))
 
 from model_wrapper import load_model, run_model
 from causalvggt.utils.load_fn import load_and_preprocess_images

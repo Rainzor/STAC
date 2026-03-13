@@ -25,7 +25,7 @@ import trimesh
 import pycolmap
 
 root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(root_dir, "src"))
+sys.path.insert(0, root_dir)
 
 from model_wrapper import load_model, run_model
 from causalvggt.utils.load_fn import load_and_preprocess_images_square

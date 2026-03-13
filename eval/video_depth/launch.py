@@ -9,13 +9,8 @@ from PIL import Image
 import imageio.v2 as iio
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, root_dir)
-# Ensure eval package is properly accessible
-eval_dir = os.path.join(root_dir, 'eval')
-sys.path.insert(0, eval_dir)
-src_dir = os.path.join(root_dir, 'src')
-sys.path.insert(0, src_dir)
-from utils.image import load_images_for_eval as load_images
-from utils.device import collate_with_cat
+from eval.utils.image import load_images_for_eval as load_images
+from eval.utils.device import collate_with_cat
 from causalvggt.utils.helper import ImgNorm2Unit as ImgDust3r2Stream3r
 
 from eval.video_depth.metadata import dataset_metadata

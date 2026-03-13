@@ -3,8 +3,8 @@ import os
 import torch
 import logging
 from safetensors.torch import load_file as load_safetensors
-# Add project root to Python path
-root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+root_dir = os.path.dirname(os.path.abspath(__file__))
 logger = logging.getLogger("model wrapper")
 
 

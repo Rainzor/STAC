@@ -1,12 +1,9 @@
 import os
 import sys
 
-# Add project root to Python path
 _file_dir = os.path.dirname(os.path.abspath(__file__))          # eval/cam_pose/
 root_dir  = os.path.dirname(os.path.dirname(_file_dir))         # project root
 sys.path.insert(0, root_dir)
-src_dir = os.path.join(root_dir, 'src')
-sys.path.insert(0, src_dir)
 
 from datetime import datetime
 import torch

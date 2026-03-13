@@ -24,7 +24,7 @@ Checkpoints go under `ckpt/{stream3r,streamvggt}/` as `model.safetensors` or `mo
 ## Common Commands
 
 ```bash
-# Single-scene / few scenes: use eval launch with dataset_type + optional scene_name (main.py is legacy, no causalvggt)
+# Single-scene / few scenes: use eval launch with dataset_type + optional scene_name
 python eval/long_recon/launch.py --output_dir eval_recon --dataset_type NRGBD --scene_name complete_kitchen \
     --model_name causalvggt --base_model stream3r --mode window_chunk_merge --streaming \
     -win 4 -ck 4 -hh 2 -ret_sz 2 -ret_buf --save_tag stac
@@ -63,21 +63,21 @@ python demo/demo_colmap.py --scene_dir /path/to/scene --output_dir output/colmap
 
 ### Two entry points
 
-- **`main.py`** — Legacy standalone CLI (may not work after vggt removal). Uses `stream3r` / `streamvggt` / `sparsevggt` only (no causalvggt); imports from `stream3r.stream_session` and backbone packages. For STAC + causalvggt use eval scripts or the Python API (see README).
-- **`src/model_wrapper.py`** — Unified `load_model(model_name, base_model)` / `run_model()` API used by evaluation scripts. Supports `model_name=causalvggt` with `StreamSession` from `src/stream_session.py` for streaming.
+- **`main.py`** — Minimal inference example using the `model_wrapper` API (see README).
+- **`model_wrapper.py`** — Unified `load_model(model_name, base_model)` / `run_model()` API used by evaluation scripts. Supports `model_name=causalvggt` with `StreamSession` from `stream_session.py` for streaming.
 
-### Core components (`src/`)
+### Core components
 
-- **`src/stream_session.py`** — `StreamSession` orchestrates frame-by-frame streaming: feeds frames, manages KV cache lifecycle (append → attention → prune → retrieve), accumulates predictions
+- **`stream_session.py`** — `StreamSession` orchestrates frame-by-frame streaming: feeds frames, manages KV cache lifecycle (append → attention → prune → retrieve), accumulates predictions
 
-- **`src/causalvggt/`** — Backbone-agnostic CausalVGGT adapter
+- **`causalvggt/`** — Backbone-agnostic CausalVGGT adapter
   - `models/vggt.py` — `CausalVGGT` model class, wraps backbone weights selected by `base_model` param
   - `models/aggregator.py` — `CausalAggregator`, 24-layer ViT-L with `SparseAttention`
   - `layers/attention.py` — `SparseAttention` implementing all attention modes (full, causal, window, window_kv, window_chunk, window_merge, window_chunk_merge)
   - `layers/block.py` — Transformer block with RoPE
   - `heads/` — CameraHead (extrinsic+intrinsic), DPTHead (depth, point maps)
 
-- **`src/stac/`** — STAC KV-cache management (plug-and-play, independent of backbone)
+- **`stac/`** — STAC KV-cache management (plug-and-play, independent of backbone)
   - `kv_manager.py` — `KVManager` base class: window-based KV cache with recent+pinned token slots, GPU/CPU buffer split
   - `h2o.py` — `HeavyHittersKV(KVManager)`: adds H2O heavy-hitter selection using attention scores
   - `stac_voxel.py` — `STACVoxelKV(HeavyHittersKV)`: full STAC with 3D voxel pool for evicted KV merge + pivot retrieval
@@ -114,7 +114,7 @@ Optional GPU-accelerated voxel merging. Built with `torch.utils.cpp_extension.CU
 
 - Input scenes: `<scene_dir>/images/*.png`
 - Evaluation datasets: symlinked under `data/` (7scenes, neural_rgbd, DTU, tum, scannet, sintel, bonn, kitti)
-- Python path: `src/` is added to `sys.path` at runtime; imports use package names directly (e.g., `from causalvggt.models.vggt import CausalVGGT`)
+- Python path: project root is in `sys.path`; imports use package names directly (e.g., `from causalvggt.models.vggt import CausalVGGT`)
 
 ## Key conventions
 

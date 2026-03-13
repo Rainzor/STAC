@@ -47,7 +47,7 @@ Feed-forward 3D models ([STream3R](https://github.com/NIRVANALAN/STream3R), [Str
 │        └───────────────┼──────────────┘             │
 │                        ▼                            │
 │              CausalVGGT Adapter                     │
-│        (src/causalvggt/models/vggt.py)              │
+│        (causalvggt/models/vggt.py)                  │
 │  ┌─────────────────────────────────────────────┐    │
 │  │ CausalAggregator  (24-layer ViT-L)          │    │
 │  │   └─ SparseAttention (flex / KV-cache)      │    │
@@ -58,7 +58,7 @@ Feed-forward 3D models ([STream3R](https://github.com/NIRVANALAN/STream3R), [Str
                          │ KV pairs
                          ▼
 ┌─────────────────────────────────────────────────────┐
-│  STAC KV-Cache  (src/stac/)     ← plug-and-play    │
+│  STAC KV-Cache  (stac/)         ← plug-and-play    │
 │  ┌─────────────┐                                    │
 │  │ KVManager   │  sliding window (recent + pinned)  │
 │  │ ├ H2O       │  heavy-hitter selection            │
@@ -68,7 +68,7 @@ Feed-forward 3D models ([STream3R](https://github.com/NIRVANALAN/STream3R), [Str
                          │
                          ▼
 ┌─────────────────────────────────────────────────────┐
-│  StreamSession  (src/stream_session.py)             │
+│  StreamSession  (stream_session.py)                 │
 │  Frame-by-frame inference + prediction accumulation │
 └─────────────────────────────────────────────────────┘
 ```
@@ -126,12 +126,9 @@ mkdir -p ckpt/stream3r && hf download yslan/STream3R --local-dir ckpt/stream3r
 
 ### Python API
 
-Run from repo root (or add `src` to `PYTHONPATH`). Example script:
+Run from repo root. Example script:
 
 ```python
-import os, sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__) or ".", "src")))
-
 import torch
 from model_wrapper import load_model, run_model
 
@@ -164,7 +161,7 @@ model = load_model("causalvggt", base_model="streamvggt", device=device)
 
 ### Command line
 
-Use the eval launch scripts for full STAC options; `main.py` is legacy (basic modes only). Scene dirs need an `images/` subfolder with `.png` files.
+`main.py` provides a minimal inference example on a scene folder; eval scripts add dataset loading and metrics. Scene dirs need an `images/` subfolder with `.png` or `.jpg` files.
 
 ```bash
 python eval/long_recon/launch.py --output_dir eval_recon --dataset_type NRGBD \
@@ -229,11 +226,11 @@ Common flags: `--model_name causalvggt --base_model stream3r --mode window_chunk
 
 | Path                                            | Role                                                                         |
 | ----------------------------------------------- | ---------------------------------------------------------------------------- |
-| `main.py`                                       | Legacy CLI; prefer eval scripts for full STAC                                |
-| `src/model_wrapper.py`                          | Unified `load_model` / `run_model` for all backbones                         |
-| `src/stream_session.py`                         | Frame-by-frame streaming and prediction accumulation                         |
-| `src/causalvggt/`                               | CausalVGGT adapter: models, SparseAttention, heads                           |
-| `src/stac/`                                     | KV manager, H2O, voxel merge/retrieval, merger, allocator, Triton flash attn |
+| `main.py`                                       | Minimal inference example (scene folder → predictions)                       |
+| `model_wrapper.py`                              | Unified `load_model` / `run_model` for all backbones                         |
+| `stream_session.py`                             | Frame-by-frame streaming and prediction accumulation                         |
+| `causalvggt/`                                   | CausalVGGT adapter: models, SparseAttention, heads                           |
+| `stac/`                                         | KV manager, H2O, voxel merge/retrieval, merger, allocator, Triton flash attn |
 | `eval/long_recon/`, `cam_pose/`, `video_depth/` | 3D recon, pose, depth                                                        |
 | `demo/`                                         | Gradio app, Viser, COLMAP                                                    |
 | `merger-cuda/`                                  | CUDA KV merger extension                                                     |
