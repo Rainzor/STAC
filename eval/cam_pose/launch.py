@@ -372,23 +372,20 @@ def main(args):
         try:
             basic_metrics = {}
             dir_path = metadata["dir_path_func"](img_path, seq)
+            scene_name = seq
+            if args.save_tag is not None:
+                save_dir = osp.join(args.output_dir, args.dataset_type, args.base_model, scene_name, args.save_tag)
+            else:
+                save_dir = osp.join(args.output_dir, args.dataset_type, args.base_model, scene_name)
             skip_condition = metadata.get("skip_condition", None)
-            if skip_condition is not None and skip_condition(
-                        save_dir, seq):
-                    continue
+            if skip_condition is not None and skip_condition(save_dir, seq):
+                continue
             filelist = [
                     os.path.join(dir_path, name)
                     for name in os.listdir(dir_path)
                 ]
             filelist.sort()
             filelist = filelist[::args.pose_eval_stride]
-       
-
-            scene_name = seq
-            if args.save_tag is not None:
-                save_dir = osp.join(args.output_dir, args.dataset_type, args.model_name, scene_name,args.save_tag)
-            else:
-                save_dir = osp.join(args.output_dir, args.dataset_type, args.model_name, scene_name)
             os.makedirs(save_dir, exist_ok=True)
             timedelta = datetime.now().strftime("%Y-%m-%d-%H-%M")
             if args.vis_tag is not None:
@@ -559,7 +556,7 @@ def main(args):
 
     if len(seq_list) > 1:
         # Save overall metrics for all scenes
-        overall_metrics_dir = osp.join(args.output_dir, args.dataset_type, args.model_name, f"overall_metrics")
+        overall_metrics_dir = osp.join(args.output_dir, args.dataset_type, args.base_model, f"overall_metrics")
         os.makedirs(overall_metrics_dir, exist_ok=True)
         if args.vis_tag is None:
             overall_metrics_file = osp.join(overall_metrics_dir, f"overall_metrics_{datetime.now().strftime('%Y%m%d_%H%M')}.json")

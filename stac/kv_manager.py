@@ -73,14 +73,16 @@ class KVManager:
         if self.reserved_buffer_size < self.hot_size + self.chunk_size:
             warnings.warn(f"Warning: buffer_size {self.reserved_buffer_size} is smaller than hh_size+recent_size+pinned ({self.hot_size}). This may lead to no pruning.")
             self.reserved_buffer_size = self.hot_size + self.chunk_size
-        
-        
+
+        # # When buffer is very large, cap GPU usage to reduce OOM risk
+        # effective_gpu_limit = min(gpu_limit, 200) if self.reserved_buffer_size > 320 else gpu_limit
+        effective_gpu_limit = gpu_limit
         # Split total buffer frames into GPU part and CPU part
-        self.reserved_buffer_size_cpu = self.reserved_buffer_size - gpu_limit
+        self.reserved_buffer_size_cpu = self.reserved_buffer_size - effective_gpu_limit
         if self.reserved_buffer_size_cpu < 0:
             self.reserved_buffer_size_cpu = 0
-        # GPU buffer is capped by gpu_limit
-        self.reserved_buffer_size = min(self.reserved_buffer_size, gpu_limit)
+        # GPU buffer is capped by effective_gpu_limit
+        self.reserved_buffer_size = min(self.reserved_buffer_size, effective_gpu_limit)
         
         assert self.token_per_f > 0, "token_per_frame must be positive."
         assert self.recent_size >= 0, "recent_size and hh_size must be non-negative."
@@ -473,16 +475,41 @@ class KVManager:
 
     def get_offset(self) -> List[int]:
         """
-        Get the current allocated size (number of tokens) for each layer.
+        Get the current allocated size (number of tokens) for each layer (GPU part only).
         """
         return self._offset_hot.copy()
-    
+
+    def get_offset_cpu(self) -> List[int]:
+        """
+        Get the current CPU cache token count per layer. Returns zeros when use_cpu is False.
+        """
+        if getattr(self, "_offset_hot_cpu", None) is None:
+            return [0] * self._L_eff
+        return self._offset_hot_cpu.copy()
+
+    def get_cpu_memory_usage(self) -> Tuple[float, float]:
+        """
+        Get CPU cache memory usage (used MB, allocated MB). Returns (0, 0) when not using CPU offload.
+        """
+        if not getattr(self, "use_cpu", False) or getattr(self, "_offset_hot_cpu", None) is None:
+            return 0.0, 0.0
+        usage = 0.0
+        alloc = 0.0
+        elem_bytes = torch.finfo(self.dtype).bits // 8
+        for l in range(self._L_eff):
+            T = self._offset_hot_cpu[l]
+            used_mem_bytes = 2 * self.num_heads * T * self.head_dim * elem_bytes
+            usage += used_mem_bytes / (1024.0 ** 2)
+            alloc_mem_bytes = 2 * self.reserved_buffer_token_size_cpu * self.num_heads * self.head_dim * elem_bytes
+            alloc += alloc_mem_bytes / (1024.0 ** 2)
+        return usage, alloc
+
     def get_memory_usage(self) -> Tuple[float, float]:
         """
-        Get the memory usage (in MB) for each layer.
+        Get the GPU cache memory usage (used MB, allocated MB) for each layer.
         """
         usage = 0.0
-        alloc = 0.0 
+        alloc = 0.0
         for l in range(self._L_eff):
             T = self._offset_hot[l]
             used_mem_bytes = 2 * self.num_heads * T * self.head_dim * torch.tensor(torch.finfo(self.dtype).bits // 8)
@@ -490,3 +517,16 @@ class KVManager:
             alloc_mem_bytes = 2 * (self.reserved_buffer_token_size) * self.num_heads * self.head_dim * torch.tensor(torch.finfo(self.dtype).bits // 8)
             alloc += alloc_mem_bytes.item() / (1024.0 **2)
         return usage, alloc
+
+    def get_memory_details(self) -> dict:
+        """Return dict compatible with eval/compare (total_usage, temporal_cache_usage, spatial_cache_usage in MB)."""
+        used, alloc = self.get_memory_usage()
+        cpu_used, cpu_alloc = self.get_cpu_memory_usage()
+        total_usage = used + cpu_used
+        return {
+            "total_usage": total_usage,
+            "total_alloc": alloc + cpu_alloc,
+            "temporal_cache_usage": used,
+            "temporal_cache_alloc": alloc,
+            "spatial_cache_usage": 0.0,
+        }

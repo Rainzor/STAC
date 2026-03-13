@@ -223,6 +223,16 @@ class CausalAggregator(nn.Module):
             kv_info["layer_indices"] = self.kv_manager.get_layers()
             kv_info["kvcache_used"], kv_info["kvcache_alloc"] = self.kv_manager.get_memory_usage()
             kv_info["kvcache_size"] = self.kv_manager.get_offset()
+            # When CPU offload is used, report CPU and total so stats reflect full context
+            if hasattr(self.kv_manager, "get_offset_cpu") and hasattr(self.kv_manager, "get_cpu_memory_usage"):
+                offset_cpu = self.kv_manager.get_offset_cpu()
+                cpu_used, cpu_alloc = self.kv_manager.get_cpu_memory_usage()
+                if offset_cpu and (cpu_used > 0 or any(offset_cpu)):
+                    gpu_sizes = kv_info["kvcache_size"]
+                    kv_info["kvcache_size_cpu"] = offset_cpu
+                    kv_info["kvcache_used_cpu"] = cpu_used
+                    kv_info["kvcache_size_total"] = [g + c for g, c in zip(gpu_sizes, offset_cpu)]
+                    kv_info["kvcache_used_total"] = kv_info["kvcache_used"] + cpu_used
             kv_info["token_indices"] = self.kv_manager.get_token_indices().detach().cpu().numpy()
             kv_info["scores"] = self.kv_manager.get_scores().detach().cpu().numpy() if hasattr(self.kv_manager, 'get_scores') else None
             

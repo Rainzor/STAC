@@ -285,7 +285,7 @@ def main(args):
             basic_metrics = {}
             scene_name = dataset.scene_list[name_idx]
             save_scene_name = f"{scene_name}/{args.save_tag}" if args.save_tag else scene_name
-            save_dir = osp.join(args.output_dir, args.dataset_type, args.model_name, save_scene_name)
+            save_dir = osp.join(args.output_dir, args.dataset_type, args.base_model, save_scene_name)
             os.makedirs(save_dir, exist_ok=True)
 
             timedelta = datetime.now().strftime("%Y-%m-%d-%H-%M")
@@ -416,7 +416,7 @@ def main(args):
     logger.info("\n".join(table_lines))
 
     if len(list(data_idx)) > 1:
-        overall_metrics_dir = osp.join(args.output_dir, args.dataset_type, args.model_name,
+        overall_metrics_dir = osp.join(args.output_dir, args.dataset_type, args.base_model,
                                        "overall_metrics", f"kf_{args.kf_every}")
         os.makedirs(overall_metrics_dir, exist_ok=True)
         suffix = f"_{args.vis_tag}" if args.vis_tag else ""

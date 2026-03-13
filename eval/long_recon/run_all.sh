@@ -28,19 +28,6 @@ for DATASET in "${DATASETS[@]}"; do
         --vis_tag "stac_cuda" \
         --mode stac
     
-    echo "=========================================="
-    echo "Evaluating dataset: ${DATASET}"
-    echo "=========================================="
-    python eval/long_recon/launch.py \
-        --output_dir "${OUTPUT_DIR}" \
-        --size 518 \
-        --kf_every ${KF_EVERY} \
-        --model_name "${MODEL_NAME}" \
-        --base_model "${BASE_MODEL}" \
-        --dataset_type "${DATASET}" \
-        --save_tag "baseline" \
-        --vis_tag "causal" \
-        --mode "window_kv" --streaming -win -1 \
 
     echo "=========================================="
     echo "Evaluating dataset: ${DATASET}"
@@ -69,4 +56,20 @@ for DATASET in "${DATASETS[@]}"; do
         --save_tag "window" \
         --vis_tag "win24" \
         --mode "window_kv" --streaming -win 24
+    
+        echo "=========================================="
+
+        
+    echo "Evaluating dataset: ${DATASET}"
+    echo "=========================================="
+    python eval/long_recon/launch.py \
+        --output_dir "${OUTPUT_DIR}" \
+        --size 518 \
+        --kf_every ${KF_EVERY} \
+        --model_name "${MODEL_NAME}" \
+        --base_model "${BASE_MODEL}" \
+        --dataset_type "${DATASET}" \
+        --save_tag "baseline" \
+        --vis_tag "causal" \
+        --mode "window_kv" --streaming -win -1 \
 done

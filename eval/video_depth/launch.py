@@ -312,7 +312,8 @@ def main():
     args = args.parse_args()
 
     model = load_model(args.model_name, args.base_model, args.device)
-    eval_pose_estimation(args, model, save_dir=args.output_dir)
+    save_dir = os.path.join(args.output_dir, args.base_model)
+    eval_pose_estimation(args, model, save_dir=save_dir)
 
 
 if __name__ == "__main__":

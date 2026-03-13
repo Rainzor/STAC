@@ -84,6 +84,9 @@ def run_model(model, images, model_name, mode='full',
     if model_name != "causalvggt":
         raise NotImplementedError(f"Model '{model_name}' not supported. Only 'causalvggt' is supported.")
 
+    # Keep user-facing mode so multi-scene eval (launch.py) does not overwrite args.mode
+    # with the expanded internal mode and break the next scene (e.g. window_size would stay 0).
+    user_mode = mode
     if mode == "stac":
         mode = "window_chunk_merge"
         streaming = True
@@ -135,7 +138,7 @@ def run_model(model, images, model_name, mode='full',
         benchmark_metrics["infer_fps"] = 1000.0 / total_time if total_time > 0 else 0
         predictions["timing"] = benchmark_metrics
 
-    predictions["mode"] = mode
+    predictions["mode"] = user_mode
     predictions["streaming"] = streaming
     # Effective config actually used (e.g. after stac expansion) for accurate metrics
     predictions["effective_config"] = {

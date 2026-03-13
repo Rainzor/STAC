@@ -316,6 +316,13 @@ class StreamSession:
                     kvcache_info = self.model.aggregator.get_kv_mgr_info()
                     kvcache_size = kvcache_info["kvcache_size"][0]
                     kvcache_mem = kvcache_info["kvcache_used"]
+                    # When CPU offload is active, show total (gpu+cpu) so stats reflect full context
+                    if "kvcache_size_total" in kvcache_info:
+                        total_tok = kvcache_info["kvcache_size_total"][0]
+                        total_mem = kvcache_info["kvcache_used_total"]
+                        cache_str = f"tokens={total_tok} (gpu {kvcache_size})  mem={total_mem:.0f}MB (gpu {kvcache_mem:.0f}MB)"
+                    else:
+                        cache_str = f"tokens={kvcache_size}  mem={kvcache_mem:.0f}MB"
 
                     agg_time = timing.get("aggregator_infer_time", 0)
                     prune_time = timing.get("kv_pruning_time", 0)
@@ -326,13 +333,21 @@ class StreamSession:
                         progress,
                         _stats_table([
                             ("Time(ms)", f"agg={agg_time:.1f}  prune={prune_time:.1f}"),
-                            ("KV Cache", f"tokens={kvcache_size}  mem={kvcache_mem:.0f}MB"),
+                            ("KV Cache", cache_str),
                             ("GPU(MB)", f"alloc={allocated:.0f}  reserved={reserved:.0f}"),
                         ]),
                     ))
                     self._processed_frames += 1
             if VERBOSE:
                 logger.info("Window mode done.")
+            # Persist Token + Memory(MB) for eval/compare (same shape as window_chunk_merge)
+            kv_mgr = self.model.aggregator.kv_manager
+            if kv_mgr is not None:
+                kvcache_info = self.model.aggregator.get_kv_mgr_info()
+                metrics = {"Token": {0: kvcache_info}}
+                if hasattr(kv_mgr, "get_memory_details"):
+                    metrics["Memory(MB)"] = kv_mgr.get_memory_details()
+                self.stats = metrics
 
         elif mode in ["window_chunk_merge"]:
             # Use Voxel attention to maintain a voxel + recent KV cache for the aggregator.

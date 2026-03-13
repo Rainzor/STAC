@@ -1,27 +1,56 @@
 """
 Compare reconstruction metrics across multiple overall_metrics JSON files.
 Displays mean and median in adjacent columns (e.g. Acc_mean, Acc_med) per run.
-Usage: python compare_overall_metrics.py [--dir DIR] [--metric METRIC] [--scene NAME]
+
+Run labels are by default model_tag (e.g. stream3r_stac). Rows are sorted by model then tag.
+Deduplication still uses tag + CONFIG_LABEL_KEYS; same config keeps the run with the latest clock.
+--tag X only loads JSON files whose filename contains X.
+
+Usage: python compare.py [--dir DIR] [--tag TAG] [--metrics ...] [--scene NAME] [--all] [--label-from config|filename]
 """
 import argparse
 import json
 from pathlib import Path
 
-# Metric groups: (display_name, mean_key, median_key)
+# Metric groups: (display_name, mean_key, median_key). Keys can be str or tuple of two keys for (k1+k2)/2.
 METRIC_GROUPS = [
     ("Acc", "accuracy", "accuracy_median"),
     ("Comp", "completion", "completion_median"),
-    ("NC1", "normal_consistency_1", "normal_consistency_1_median"),
-    ("NC2", "normal_consistency_2", "normal_consistency_2_median"),
+    ("NC", ("normal_consistency_1", "normal_consistency_2"), ("normal_consistency_1_median", "normal_consistency_2_median")),
 ]
 
-ALL_KEYS = []
-for _dn, mk, mdk in METRIC_GROUPS:
-    ALL_KEYS.append(mk)
-    ALL_KEYS.append(mdk)
+ALL_KEYS = [
+    "accuracy", "accuracy_median",
+    "completion", "completion_median",
+    "normal_consistency_1", "normal_consistency_2",
+    "normal_consistency_1_median", "normal_consistency_2_median",
+]
 
-# Lower is better for acc/comp; higher is better for normal_consistency
-LOWER_BETTER = {"accuracy", "completion", "accuracy_median", "completion_median"}
+# Lower is better for Acc, Comp (mean & med); higher is better for NC (mean & med)
+LOWER_BETTER = {"accuracy", "completion", "accuracy_median", "completion_median", "Acc", "Comp"}
+
+# Keys used to distinguish runs: tag (from filename) + model config from JSON
+CONFIG_LABEL_KEYS = (
+    "base_model",
+    "mode",
+    "window_size",
+    "hh_size",
+    "retrieval_size",
+    "chunk_size",
+    "voxel_backend",
+)
+# Tag is extracted from filename and prepended to config identity (tag + CONFIG_LABEL_KEYS)
+
+# Short abbreviations for mode in labels
+MODE_ABBREV = {
+    "full": "full",
+    "causal": "causal",
+    "window": "win",
+    "window_kv": "wkv",
+    "window_chunk": "wc",
+    "window_merge": "wm",
+    "window_chunk_merge": "wcm",
+}
 
 
 def short_name(filename: str) -> str:
@@ -38,15 +67,83 @@ def short_name(filename: str) -> str:
     return "_".join(cleaned) if cleaned else stem
 
 
-def load_files(directory: str):
+def tag_from_filename(filename: str) -> str:
+    """Extract tag from filename: first segment after overall/metrics (e.g. overall_metrics_stac_w4_... -> 'stac')."""
+    stem = Path(filename).stem
+    parts = stem.split("_")
+    for p in parts:
+        if p in ("overall", "metrics"):
+            continue
+        if len(p) == 8 and p.isdigit():
+            break
+        return p
+    return ""
+
+
+def config_signature(model: dict, filename_tag: str) -> tuple:
+    """Unique tuple (filename_tag, base_model, mode, ...) for deduplication; same (tag + CONFIG_LABEL_KEYS) keeps latest clock."""
+    head = (filename_tag,)
+    if not model:
+        return head
+    return head + tuple(model.get(k) for k in CONFIG_LABEL_KEYS)
+
+
+def config_to_label(model: dict, filename_tag: str = "") -> str:
+    """Build run label for display: model_tag (e.g. stream3r_stac). Rows sort by model then tag."""
+    if not model:
+        return f"unknown_{filename_tag}" if filename_tag else "unknown"
+    base = model.get("base_model")
+    if base is None:
+        return f"unknown_{filename_tag}" if filename_tag else "unknown"
+    if filename_tag:
+        return f"{base}_{filename_tag}"
+    return str(base)
+
+
+def _latest_clock(data: dict) -> str:
+    """Return the latest clock string from any scene entry (format YYYY-MM-DD-HH-MM)."""
+    clocks = []
+    for entry in data.values():
+        if isinstance(entry, dict) and "clock" in entry:
+            clocks.append(entry["clock"])
+    return max(clocks) if clocks else ""
+
+
+def load_files(directory: str, label_from: str = "config", tag: str | None = None):
     directory = Path(directory)
-    runs = {}
+    candidates = []
     for f in sorted(directory.glob("*.json")):
         if f.name == "compare_results.json":
             continue
+        filename_tag = tag_from_filename(f.name)
+        if tag is not None and tag not in f.name:
+            continue
         with open(f) as fp:
             data = json.load(fp)
-        label = short_name(f.name)
+        first_entry = next(iter(data.values()), {})
+        model = first_entry.get("model", {}) if isinstance(first_entry, dict) else {}
+        sig = config_signature(model, filename_tag)
+        clock = _latest_clock(data)
+        candidates.append((f, data, model, filename_tag, sig, clock))
+
+    # Same (tag + CONFIG_LABEL_KEYS) → keep only the file with latest clock
+    by_config = {}
+    for f, data, model, filename_tag, sig, clock in candidates:
+        if sig not in by_config or clock > by_config[sig][1]:
+            by_config[sig] = (f, data, model, filename_tag, clock)
+
+    runs = {}
+    seen_labels = {}
+    for (f, data, model, filename_tag, _clock) in by_config.values():
+        if label_from == "config":
+            label = config_to_label(model, filename_tag)
+            if label in seen_labels:
+                seen_labels[label] += 1
+                label = f"{label}_{seen_labels[label]}"
+            else:
+                seen_labels[label] = 0
+        else:
+            label = short_name(f.name)
         runs[label] = {"path": str(f), "data": data}
     return runs
 
@@ -107,7 +204,7 @@ def compute_mem_stats(mem: dict) -> dict | None:
         return None
     total_usage = mem.get("total_usage")
     actual = (
-        mem.get("temporal_cache_usage", 0) + mem.get("`spatial_cache_usage`", 0)
+        mem.get("temporal_cache_usage", 0) + mem.get("spatial_cache_usage", 0)
     )
     return {
         "total_usage_mb": total_usage,
@@ -126,19 +223,30 @@ def compute_averages(scene_metrics: dict) -> dict:
     return {k: totals[k] / counts[k] for k in totals}
 
 
-def rank_values(vals: list, metric: str):
+def _metric_value(m: dict, key) -> float | None:
+    """Get scalar for one metric: m[key] if key is str, else (m[k1]+m[k2])/2 if key is (k1,k2)."""
+    if isinstance(key, str):
+        return m.get(key)
+    k1, k2 = key
+    v1, v2 = m.get(k1), m.get(k2)
+    if v1 is not None and v2 is not None:
+        return (v1 + v2) / 2.0
+    return None
+
+
+def rank_values(vals: list, metric_name: str):
     """Return (best, second_best) scalar values."""
     if not vals:
         return None, None
-    lower_better = metric in LOWER_BETTER
+    lower_better = metric_name in LOWER_BETTER
     sorted_vals = sorted(vals, reverse=not lower_better)
     best = sorted_vals[0]
     second = sorted_vals[1] if len(sorted_vals) > 1 else best
     return best, second
 
 
-def format_cell(v, best_val, second_val, width=10):
-    """Return (raw_str, colored_str) for alignment and display. Bold green best, underline yellow second."""
+def format_cell(v, best_val, second_val, width=12):
+    """Return cell string with visible width=width for alignment. Bold green best, underline yellow second."""
     if v is None:
         raw = "N/A"
     else:
@@ -149,55 +257,81 @@ def format_cell(v, best_val, second_val, width=10):
         colored = f"\033[4;33m{raw}\033[0m"
     else:
         colored = raw
-    padded = colored + " " * (width - len(raw))
-    return padded
+    # Pad so visible width equals width (pad after content so columns align)
+    pad = width - len(raw)
+    return colored + (" " * pad) if pad > 0 else colored
 
 
-def print_table(runs: dict, metric_groups: list, scene_filter=None):
-    run_labels = list(runs.keys())
+def print_table(runs: dict, metric_groups: list, scene_filter=None, show_all_scenes=False):
+    run_labels = sorted(runs.keys())  # order: model then tag (e.g. stream3r_stac, stream3r_win8, streamvggt_stac)
 
     # Per-run averages
     avg_per_run = {}
+    all_scenes_union = set()
     for label, info in runs.items():
         sm = extract_metrics(info["data"])
         avg_per_run[label] = compute_averages(sm)
+        all_scenes_union.update(sm.keys())
+    all_scenes_sorted = sorted(all_scenes_union)
+    if scene_filter:
+        all_scenes_sorted = [s for s in all_scenes_sorted if scene_filter.lower() in s.lower()]
+    n_scenes = len(all_scenes_sorted)
+    scenes_line = ", ".join(all_scenes_sorted) if all_scenes_sorted else "(none)"
+    if n_scenes > 10:
+        scenes_line = ", ".join(all_scenes_sorted[:8]) + f", ... ({n_scenes} scenes)"
+    else:
+        scenes_line = ", ".join(all_scenes_sorted) + f" ({n_scenes} scene{'s' if n_scenes != 1 else ''})"
 
-    col_w = 10
-    metric_w = max(4, max(len(dn) for dn, _, _ in metric_groups) + 1)
+    # Column widths: first column = run label; then Acc_mean, Acc_med, Comp_mean, ...
+    num_col_w = 12
+    col_w = num_col_w
+    run_col_w = max(6, max(len(str(l)) for l in run_labels))
 
-    # Header: Metric | run_mean run_med | run_mean run_med | ...
+    # Header: Run | Acc_mean | Acc_med | Comp_mean | Comp_med | NC_mean | NC_med
     def build_header():
-        parts = [f"{'Metric':<{metric_w}}"]
-        for label in run_labels:
-            parts.append(f"{label}_mean".ljust(col_w))
-            parts.append(f"{label}_med".ljust(col_w))
+        parts = [f"{'Run':<{run_col_w}}"]
+        for display_name, _mean_key, _med_key in metric_groups:
+            parts.append(f"{display_name}_mean".ljust(col_w))
+            parts.append(f"{display_name}_med".ljust(col_w))
         return "  ".join(parts)
 
     header = build_header()
     sep_len = len(header)
 
     print("\n" + "=" * sep_len)
-    print("  AVERAGE METRICS ACROSS ALL SCENES (mean | med adjacent per run)")
+    print("  AVERAGE METRICS ACROSS ALL SCENES (rows = runs, columns = Acc_mean, Acc_med, ...)")
+    print("  Averaged over: " + scenes_line)
     print("=" * sep_len)
     print(header)
     print("-" * sep_len)
 
+    # Per-metric best/second for coloring (over runs)
+    best_second = {}
     for display_name, mean_key, med_key in metric_groups:
-        vals_mean = [avg_per_run[l].get(mean_key) for l in run_labels]
-        vals_med = [avg_per_run[l].get(med_key) for l in run_labels]
+        vals_mean = [_metric_value(avg_per_run[l], mean_key) for l in run_labels]
+        vals_med = [_metric_value(avg_per_run[l], med_key) for l in run_labels]
         valid_mean = [v for v in vals_mean if v is not None]
         valid_med = [v for v in vals_med if v is not None]
-        best_mean, second_mean = rank_values(valid_mean, mean_key)
-        best_med, second_med = rank_values(valid_med, med_key)
+        best_second[(display_name, "mean")] = rank_values(valid_mean, display_name)
+        best_second[(display_name, "med")] = rank_values(valid_med, display_name)
 
-        row = f"{display_name:<{metric_w}}"
-        for i, label in enumerate(run_labels):
-            vm = vals_mean[i]
-            vd = vals_med[i]
-            row += "  " + format_cell(vm, best_mean, second_mean, col_w) + format_cell(vd, best_med, second_med, col_w)
+    # One row per run
+    for label in run_labels:
+        row = f"{label:<{run_col_w}}"
+        for display_name, mean_key, med_key in metric_groups:
+            vm = _metric_value(avg_per_run[label], mean_key)
+            vd = _metric_value(avg_per_run[label], med_key)
+            best_mean, second_mean = best_second[(display_name, "mean")]
+            best_med, second_med = best_second[(display_name, "med")]
+            row += "  " + format_cell(vm, best_mean, second_mean, col_w) + "  " + format_cell(vd, best_med, second_med, col_w)
         print(row)
 
-    # Per-scene breakdown
+    # Per-scene breakdown: only when --all or --scene is set
+    if not show_all_scenes and not scene_filter:
+        print("\n\033[1;32mGreen/bold\033[0m = best,  \033[4;33mYellow/underline\033[0m = 2nd best")
+        print("Lower is better: Acc, Comp. Higher is better: NC=(NC1+NC2)/2.")
+        return
+
     all_scenes = set()
     for info in runs.values():
         all_scenes.update(extract_metrics(info["data"]).keys())
@@ -213,33 +347,46 @@ def print_table(runs: dict, metric_groups: list, scene_filter=None):
         print(header)
         print("-" * sep_len)
 
+        # Best/second per metric for this scene
+        best_second_scene = {}
         for display_name, mean_key, med_key in metric_groups:
-            vals_mean = []
-            vals_med = []
-            for label in run_labels:
-                sm = extract_metrics(runs[label]["data"])
-                m = sm.get(scene, {})
-                vals_mean.append(m.get(mean_key))
-                vals_med.append(m.get(med_key))
+            vals_mean = [_metric_value(extract_metrics(runs[l]["data"]).get(scene, {}), mean_key) for l in run_labels]
+            vals_med = [_metric_value(extract_metrics(runs[l]["data"]).get(scene, {}), med_key) for l in run_labels]
             valid_mean = [v for v in vals_mean if v is not None]
             valid_med = [v for v in vals_med if v is not None]
-            best_mean, second_mean = rank_values(valid_mean, mean_key)
-            best_med, second_med = rank_values(valid_med, med_key)
+            best_second_scene[(display_name, "mean")] = rank_values(valid_mean, display_name)
+            best_second_scene[(display_name, "med")] = rank_values(valid_med, display_name)
 
-            row = f"{display_name:<{metric_w}}"
-            for i in range(len(run_labels)):
-                row += "  " + format_cell(vals_mean[i], best_mean, second_mean, col_w) + format_cell(vals_med[i], best_med, second_med, col_w)
+        for label in run_labels:
+            sm = extract_metrics(runs[label]["data"])
+            m = sm.get(scene, {})
+            row = f"{label:<{run_col_w}}"
+            for display_name, mean_key, med_key in metric_groups:
+                vm = _metric_value(m, mean_key)
+                vd = _metric_value(m, med_key)
+                best_mean, second_mean = best_second_scene[(display_name, "mean")]
+                best_med, second_med = best_second_scene[(display_name, "med")]
+                row += "  " + format_cell(vm, best_mean, second_mean, col_w) + "  " + format_cell(vd, best_med, second_med, col_w)
             print(row)
 
     print("\n\033[1;32mGreen/bold\033[0m = best,  \033[4;33mYellow/underline\033[0m = 2nd best")
-    print("Lower is better: Acc, Comp (mean & med). Higher is better: NC1, NC2 (mean & med).")
+    print("Lower is better: Acc, Comp (mean & med). Higher is better: NC=(NC1+NC2)/2 (mean & med).")
+
+
+def _cell_right(s: str, width: int, best_val=None, second_val=None, value=None) -> str:
+    """Format cell with visible width=width (pad left). Optionally color if value is best/second."""
+    pad = width - len(s)
+    pad_str = " " * pad if pad > 0 else ""
+    if value is not None and best_val is not None and value == best_val:
+        return pad_str + f"\033[1;32m{s}\033[0m"
+    if value is not None and second_val is not None and value == second_val and value != best_val:
+        return pad_str + f"\033[4;33m{s}\033[0m"
+    return pad_str + s
 
 
 def print_time_memory_tables(runs: dict, scene_filter=None):
     """Print Time (total, FPS, backbone-only time/FPS) and Memory (total MB, actual MB) per run."""
-    run_labels = list(runs.keys())
-    col_w = max(12, max(len(l) for l in run_labels) + 2)
-    metric_w = 18
+    run_labels = sorted(runs.keys())  # order: model then tag
 
     # Collect per-scene time & mem stats for each run
     all_scenes = set()
@@ -279,64 +426,72 @@ def print_time_memory_tables(runs: dict, scene_filter=None):
         for k in mem_keys:
             avg_mem[label][k] = sum(mem_vals[k]) / len(mem_vals[k]) if mem_vals[k] else None
 
-    # Time table: lower total_time / backbone_time is better; higher fps is better
-    header = f"{'Metric':<{metric_w}}" + "".join(f"{l:>{col_w}}" for l in run_labels)
-    sep_len = len(header)
+    # Column layout: Run | metric1 | metric2 | ... (same as main table)
+    run_col_w = max(6, max(len(l) for l in run_labels))
+    num_col_w = 12
+
+    # Time table: header Run | Total time (ms) | Backbone time (ms); one row per run (lower is better)
+    time_rows = [
+        ("Total time (ms)", "total_time_ms", ".2f"),
+        ("Backbone time (ms)", "backbone_time_ms", ".2f"),
+    ]
+    time_col_w = max(num_col_w, max(len(name) for name, _, _ in time_rows))
+    time_header_parts = [f"{'Run':<{run_col_w}}"] + [f"{name}".ljust(time_col_w) for name, _key, _fmt in time_rows]
+    time_header = "  ".join(time_header_parts)
+    sep_len = len(time_header)
     print("\n" + "=" * sep_len)
     print("  TIME (ms): total, backbone-only (aggregator_infer + kv_position + kv_retrieval + kv_prune_merge)")
     print("=" * sep_len)
-    print(header)
+    print(time_header)
     print("-" * sep_len)
-    for row_name, key in [
-        ("Total time (ms)", "total_time_ms"),
-        ("Backbone time (ms)", "backbone_time_ms"),
-    ]:
+    time_best_second = {}
+    for row_name, key, fmt in time_rows:
         vals = [avg_time[l].get(key) for l in run_labels]
         valid = [v for v in vals if v is not None]
-        lower_better = key.endswith("_ms")  # time ms: lower better; fps: higher better
         if valid:
-            sorted_v = sorted(valid, reverse=not lower_better)
-            best, second = sorted_v[0], sorted_v[1] if len(sorted_v) > 1 else sorted_v[0]
+            sorted_v = sorted(valid)
+            time_best_second[key] = (sorted_v[0], sorted_v[1] if len(sorted_v) > 1 else sorted_v[0])
         else:
-            best = second = None
-        line = f"{row_name:<{metric_w}}"
-        for v in vals:
-            if v is None:
-                line += f"{'N/A':>{col_w}}"
-            else:
-                raw = f"{v:.2f}"
-                if v == best:
-                    raw = f"\033[1;32m{raw}\033[0m"
-                elif v == second and v != best:
-                    raw = f"\033[4;33m{raw}\033[0m"
-                line += f"{raw:>{col_w}}"
+            time_best_second[key] = (None, None)
+    for label in run_labels:
+        line = f"{label:<{run_col_w}}"
+        for _row_name, key, fmt in time_rows:
+            v = avg_time[label].get(key)
+            raw = "N/A" if v is None else f"{v:{fmt}}"
+            best, second = time_best_second[key]
+            line += "  " + _cell_right(raw, time_col_w, best_val=best, second_val=second, value=v)
         print(line)
 
-    # Memory table: backend total_usage/total_alloc; actual = temporal_cache + spatial_cache (attention working set)
+    # Memory table: header Run | Total usage (MB) | Actual/working set (MB); one row per run (lower is better)
+    mem_rows = [
+        ("Total usage (MB)", "total_usage_mb", ".1f"),
+        ("Actual/working set (MB)", "actual_mem_mb", ".1f"),
+    ]
+    mem_col_w = max(num_col_w, max(len(name) for name, _, _ in mem_rows))
+    mem_header_parts = [f"{'Run':<{run_col_w}}"] + [f"{name}".ljust(mem_col_w) for name, _key, _fmt in mem_rows]
+    mem_header = "  ".join(mem_header_parts)
+    sep_len = max(sep_len, len(mem_header))
     print("\n" + "=" * sep_len)
     print("  MEMORY (MB): total_usage; actual = temporal + spatial (attention working set)")
     print("=" * sep_len)
-    print(header)
+    print(mem_header)
     print("-" * sep_len)
-    for row_name, key in [
-        ("Total usage (MB)", "total_usage_mb"),
-        ("Actual/working set (MB)", "actual_mem_mb"),
-    ]:
+    mem_best_second = {}
+    for _row_name, key, _fmt in mem_rows:
         vals = [avg_mem[l].get(key) for l in run_labels]
         valid = [v for v in vals if v is not None]
-        best = min(valid) if valid else None
-        second = sorted(valid)[1] if len(valid) > 1 else best
-        line = f"{row_name:<{metric_w}}"
-        for v in vals:
-            if v is None:
-                line += f"{'N/A':>{col_w}}"
-            else:
-                raw = f"{v:.1f}"
-                if v == best:
-                    raw = f"\033[1;32m{raw}\033[0m"
-                elif v == second and v != best:
-                    raw = f"\033[4;33m{raw}\033[0m"
-                line += f"{raw:>{col_w}}"
+        if valid:
+            sorted_v = sorted(valid)
+            mem_best_second[key] = (sorted_v[0], sorted_v[1] if len(sorted_v) > 1 else sorted_v[0])
+        else:
+            mem_best_second[key] = (None, None)
+    for label in run_labels:
+        line = f"{label:<{run_col_w}}"
+        for _row_name, key, fmt in mem_rows:
+            v = avg_mem[label].get(key)
+            raw = "N/A" if v is None else f"{v:{fmt}}"
+            best, second = mem_best_second[key]
+            line += "  " + _cell_right(raw, mem_col_w, best_val=best, second_val=second, value=v)
         print(line)
 
 
@@ -364,9 +519,9 @@ def main():
     parser.add_argument(
         "--metrics",
         nargs="+",
-        default=["Acc", "Comp", "NC1", "NC2"],
+        default=["Acc", "Comp", "NC"],
         choices=[dn for dn, _, _ in METRIC_GROUPS],
-        help="Metric groups to display (Acc, Comp, NC1, NC2)",
+        help="Metric groups to display (Acc, Comp, NC=(NC1+NC2)/2)",
     )
     parser.add_argument(
         "--scene",
@@ -378,23 +533,42 @@ def main():
         action="store_true",
         help="Also print model configs for each run",
     )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Print per-scene breakdown for all scenes (default: only average across scenes)",
+    )
+    parser.add_argument(
+        "--label-from",
+        choices=["config", "filename"],
+        default="config",
+        help="Run label: from JSON model config (base_model, mode, window_size, hh_size, retrieval_size, chunk_size, voxel_backend) or from filename (default: config)",
+    )
+    parser.add_argument(
+        "--tag",
+        default=None,
+        help="Only consider JSON files whose filename contains this tag; among tag-matched files, same config (CONFIG_LABEL_KEYS) keeps the run with latest clock",
+    )
     args = parser.parse_args()
 
-    runs = load_files(args.dir)
+    runs = load_files(args.dir, label_from=args.label_from, tag=args.tag)
     if not runs:
-        print(f"No JSON files found in {args.dir}")
+        msg = f"No JSON files found in {args.dir}"
+        if args.tag:
+            msg += f" (with tag '{args.tag}' in filename)"
+        print(msg)
         return
 
     groups = [g for g in METRIC_GROUPS if g[0] in args.metrics]
 
-    print(f"\nLoaded {len(runs)} run(s) from: {args.dir}")
-    for label, info in runs.items():
-        print(f"  [{label}]  {Path(info['path']).name}")
+    print(f"\nLoaded {len(runs)} run(s) from: {args.dir}" + (f" (filename contains '{args.tag}')" if args.tag else ""))
+    for label in sorted(runs.keys()):
+        print(f"  [{label}]  {Path(runs[label]['path']).name}")
 
     if args.configs:
         print_run_configs(runs)
 
-    print_table(runs, groups, scene_filter=args.scene)
+    print_table(runs, groups, scene_filter=args.scene, show_all_scenes=args.all)
     print_time_memory_tables(runs, scene_filter=args.scene)
 
 
