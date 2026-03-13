@@ -1257,6 +1257,38 @@ int64_t MergerWrapper::workspace_bytes() const {
     return workspace_.defined() ? workspace_.nbytes() : 0;
 }
 
+std::map<std::string, int64_t> MergerWrapper::pool_stats() const {
+    std::map<std::string, int64_t> result;
+
+    // Actual token counts from per-row counters (GPU reductions).
+    result["buf_data_count"] = buf_row_count_.sum().item<int64_t>();
+    result["piv_data_count"] = piv_row_count_.sum().item<int64_t>();
+
+    if (use_seg_mode_) {
+        // Segmented mode: 1 token per segment slot.
+        int32_t buf_free = seg_buf_free_top_.item<int32_t>();
+        int32_t piv_free = (piv_zone_top_.defined() && config_.piv_num_zones > 0)
+            ? piv_zone_top_.sum().item<int32_t>()
+            : seg_piv_free_top_.item<int32_t>();
+
+        result["buf_alloc_count"] = seg_buf_cap_;
+        result["buf_used_slots"]  = seg_buf_cap_ - buf_free;
+        result["piv_alloc_count"] = seg_piv_cap_;
+        result["piv_used_slots"]  = seg_piv_cap_ - piv_free;
+    } else {
+        // Contiguous mode: B tokens per buffer slot, P tokens per pivot slot.
+        int32_t buf_free = buf_free_top_.item<int32_t>();
+        int32_t piv_free = piv_free_top_.item<int32_t>();
+
+        result["buf_alloc_count"] = buf_pool_cap_ * config_.B;
+        result["buf_used_slots"]  = buf_pool_cap_ - buf_free;
+        result["piv_alloc_count"] = piv_pool_cap_ * config_.P;
+        result["piv_used_slots"]  = piv_pool_cap_ - piv_free;
+    }
+
+    return result;
+}
+
 void MergerWrapper::insert_and_merge(
     torch::Tensor K_new, 
     torch::Tensor V_new, 

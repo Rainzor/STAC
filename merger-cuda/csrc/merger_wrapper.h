@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -162,6 +163,8 @@ public:
     int64_t valid_pivot_count() const;
     int64_t workspace_bytes() const;
     
+    std::map<std::string, int64_t> pool_stats() const;
+
     const backend::MergerConfig& config() const { return config_; }
     const backend::MergerViews& views() const { return views_; }
 

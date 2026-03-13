@@ -1,5 +1,6 @@
 import os
 import sys
+import logging
 import numpy as np
 import torch
 import argparse
@@ -7,8 +8,16 @@ from accelerate import PartialState
 from tqdm import tqdm
 from PIL import Image
 import imageio.v2 as iio
+
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, root_dir)
+
+logger = logging.getLogger("EvalLogger")
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+    datefmt="%H:%M:%S",
+)
 from eval.utils.image import load_images_for_eval as load_images
 from eval.utils.device import collate_with_cat
 from causalvggt.utils.helper import ImgNorm2Unit as ImgDust3r2Stream3r
@@ -85,7 +94,8 @@ def get_args_parser():
         default="sintel",
         choices=list(dataset_metadata.keys()),
     )
-    parser.add_argument("--size", type=int, default="512")
+    parser.add_argument("--size", type=int, default=518,
+                        help="Image load size: long side for 512/518, short side for 224 (same as cam_pose/long_recon)")
 
     parser.add_argument(
         "--pose_eval_stride", default=1, type=int, help="stride for pose evaluation"
@@ -259,7 +269,7 @@ def eval_pose_estimation_dist(args,
 
                 images = load_images(
                     filelist,
-                    size=518,
+                    size=args.size,
                     verbose=False,
                     crop=False,
                 )
@@ -269,9 +279,7 @@ def eval_pose_estimation_dist(args,
                 images = ImgDust3r2Stream3r(images).to(device)
                 predictions = run(images, model, dtype=torch.float16, device=device, args=args)
 
-                print(
-                    f"Finished depth estmation of {len(filelist)} images"
-                )
+                logger.info("Finished depth estimation of %d images", len(filelist))
 
                 os.makedirs(f"{save_dir}/{seq}", exist_ok=True)
                 save_depth_maps(None,
@@ -287,14 +295,13 @@ def eval_pose_estimation_dist(args,
                         f.write(
                             f"OOM error in sequence {seq}, skipping this sequence.\n"
                         )
-                    print(f"OOM error in sequence {seq}, skipping...")
+                    logger.warning("OOM error in sequence %s, skipping...", seq)
                 elif "Degenerate covariance rank" in str(
                         e) or "Eigenvalues did not converge" in str(e):
                     # Handle Degenerate covariance rank exception and Eigenvalues did not converge exception
                     with open(error_log_path, "a") as f:
                         f.write(f"Exception in sequence {seq}: {str(e)}\n")
-                    print(
-                        f"Traj evaluation error in sequence {seq}, skipping.")
+                    logger.warning("Traj evaluation error in sequence %s, skipping.", seq)
                 else:
                     raise e  # Rethrow if it's not an expected exception
     return None, None, None

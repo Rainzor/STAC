@@ -69,7 +69,9 @@ def get_args_parser():
         default="eval_results/all",
         help="value for outdir",
     )
-    parser.add_argument("--size", type=int, default=512)
+    parser.add_argument("--size", type=int, default=518 ,
+                        choices=[224, 512, 518],
+                        help="Image load size: long side for 512/518, short side for 224")
 
     # scene / dataset
     parser.add_argument("--dataset_type", type=str, required=True,
@@ -177,7 +179,7 @@ def run(images, model, dtype, device, args):
     predictions['pose_enc_list'] = None # remove pose_enc_list
 
     # Generate world points from depth map
-    print("Computing world points from depth map...")
+    logger.info("Computing world points from depth map...")
     depth_map = predictions["depth"]  # (S, H, W, 1)
     world_points = unproject_depth_map_to_point_map(depth_map, predictions["extrinsic"], predictions["intrinsic"])
     predictions["world_points_from_depth"] = world_points
@@ -329,16 +331,6 @@ def get_ground_truth(batch_data, images):
 
 
 def main(args):
-    # W,H
-    if args.size == 518:
-        resolution = (518, 336)
-    elif args.size == 512:
-        resolution = (512, 384)
-    elif args.size == 224:
-        resolution = (224, 224)
-    else:
-        raise NotImplementedError
-
     # Create dataset based on specified type
     if args.dataset_type in ["sintel", "scannet", "tum"]:
         metadata = dataset_metadata.get(args.dataset_type)
@@ -412,10 +404,10 @@ def main(args):
             basic_metrics["scene"] = scene_name
 
 
-            # Load images
+            # Load images (resolution controlled by --size: 518/512 for long side, 224 for short side)
             images = load_images(
                     filelist,
-                    size=518,
+                    size=args.size,
                     verbose=False,
                     crop=False,
                 )
@@ -424,7 +416,7 @@ def main(args):
             images = torch.stack([view["img"] for view in images], dim=1)
             images = ImgDust3r2Stream3r(images).to(device)
             images = images.squeeze(0)  # remove batch dimension
-            print(f"Loaded Images shape: {images.shape}")
+            logger.info("Loaded Images shape: %s", images.shape)
 
 
 
@@ -510,14 +502,13 @@ def main(args):
                     f.write(
                         f"OOM error in sequence {seq}, skipping this sequence.\n"
                     )
-                print(f"OOM error in sequence {seq}, skipping...")
+                logger.warning("OOM error in sequence %s, skipping...", seq)
             elif "Degenerate covariance rank" in str(
                     e) or "Eigenvalues did not converge" in str(e):
                 # Handle Degenerate covariance rank exception and Eigenvalues did not converge exception
                 with open(error_log_path, "a") as f:
                     f.write(f"Exception in sequence {seq}: {str(e)}\n")
-                print(
-                    f"Traj evaluation error in sequence {seq}, skipping.")
+                logger.warning("Traj evaluation error in sequence %s, skipping.", seq)
             else:
                 raise e  # Rethrow if it's not an expected exception
 
@@ -549,22 +540,24 @@ def main(args):
 
     sep = "  "
     header_str = sep.join(c.ljust(col_w[c]) for c in header_cols)
-    hline      = sep.join("-" * col_w[c] for c in header_cols)
-
-    logger.info("\n📊 Trajectory Evaluation Summary")
-    print(header_str)
-    print(hline)
-    for row in scene_rows:
-        print(sep.join(_fmt(row.get(c)).ljust(col_w[c]) for c in header_cols))
-    print(hline)
-
+    hline = sep.join("-" * col_w[c] for c in header_cols)
     mean_row = {"scene": f"MEAN({len(scene_rows)})"}
     for m in traj_metrics:
         for s in traj_stats:
             vals = accum[m][s]
             mean_row[f"{m}.{s}"] = sum(vals) / len(vals) if vals else float("nan")
-    print(sep.join(_fmt(mean_row.get(c)).ljust(col_w[c]) for c in header_cols))
-    print()
+
+    table_lines = [
+        "",
+        "📊 Trajectory Evaluation Summary",
+        header_str,
+        hline,
+    ]
+    for row in scene_rows:
+        table_lines.append(sep.join(_fmt(row.get(c)).ljust(col_w[c]) for c in header_cols))
+    table_lines.append(hline)
+    table_lines.append(sep.join(_fmt(mean_row.get(c)).ljust(col_w[c]) for c in header_cols))
+    logger.info("\n".join(table_lines))
 
     if len(seq_list) > 1:
         # Save overall metrics for all scenes
@@ -601,5 +594,5 @@ if __name__ == "__main__":
     cmd = "python " + " ".join(sys.argv)
     with open(this_log, "w") as f:
         f.write(cmd + "\n")
-    print(f"Logging to {this_log}")
+    logger.info("Logging to %s", this_log)
     main(args)

@@ -205,7 +205,7 @@ def run(images, model, dtype, device, args):
 
 def main(args):
     if args.size == 518:
-        resolution = (518, 336)
+        resolution = (518, 392)
     elif args.size == 512:
         resolution = (512, 384)
     elif args.size == 224:
@@ -375,21 +375,23 @@ def main(args):
 
     sep = "  "
     header_str = sep.join(c.ljust(col_w[c]) for c in header_cols)
-    hline      = sep.join("-" * col_w[c] for c in header_cols)
-
-    logger.info("\n📊 Reconstruction Evaluation Summary")
-    print(header_str)
-    print(hline)
-    for row in scene_rows:
-        print(sep.join(_fmt(row.get(c)).ljust(col_w[c]) for c in header_cols))
-    print(hline)
-
+    hline = sep.join("-" * col_w[c] for c in header_cols)
     mean_row = {"scene": f"MEAN({len(scene_rows)})"}
     for c in display_cols:
         vals = accum[c]
         mean_row[c] = sum(vals) / len(vals) if vals else float("nan")
-    print(sep.join(_fmt(mean_row.get(c)).ljust(col_w[c]) for c in header_cols))
-    print()
+
+    table_lines = [
+        "",
+        "📊 Reconstruction Evaluation Summary",
+        header_str,
+        hline,
+    ]
+    for row in scene_rows:
+        table_lines.append(sep.join(_fmt(row.get(c)).ljust(col_w[c]) for c in header_cols))
+    table_lines.append(hline)
+    table_lines.append(sep.join(_fmt(mean_row.get(c)).ljust(col_w[c]) for c in header_cols))
+    logger.info("\n".join(table_lines))
 
     if len(list(data_idx)) > 1:
         overall_metrics_dir = osp.join(args.output_dir, args.dataset_type, args.model_name,
@@ -416,5 +418,5 @@ if __name__ == "__main__":
     this_log = os.path.join(log_dir, f"{scene_name}_{timestamp}.txt")
     with open(this_log, "w") as f:
         f.write("python " + " ".join(sys.argv) + "\n")
-    print(f"Logging to {this_log}")
+    logger.info("Logging to %s", this_log)
     main(args)

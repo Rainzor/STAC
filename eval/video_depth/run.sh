@@ -15,10 +15,10 @@ for model in "${base_models[@]}"; do
         echo "Saving depth results to: $causal_dir"
         python eval/video_depth/launch.py \
         --output_dir="$causal_dir" \
+        --size 518 \
         --model_name causalvggt --base_model="$model" \
-        --mode window_chunk_merge --streaming \
-        --eval_dataset="$data" \
-        -win 4 -hh 2 -ret_sz 2 -ck 4
+        --mode stac \
+        --eval_dataset="$data"
 
         python eval/video_depth/eval_depth.py \
         --output_dir "$causal_dir" \

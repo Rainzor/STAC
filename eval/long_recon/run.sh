@@ -6,16 +6,10 @@ OUTPUT_DIR="${WORKDIR}/eval_recon"
 
 MODEL_NAME="causalvggt"
 BASE_MODEL="stream3r"
-
-MODE="window_chunk_merge"
-WIN=4
-HH=2
-RET_SZ=2
-CK=4
 KF_EVERY=5
 
 SAVE_TAG="stac"
-VIS_TAG="w4h2r2c4"
+VIS_TAG="stac"
 
 DATASETS=("NRGBD" "7scenes")
 
@@ -32,11 +26,5 @@ for DATASET in "${DATASETS[@]}"; do
         --dataset_type "${DATASET}" \
         --save_tag "${SAVE_TAG}" \
         --vis_tag "${VIS_TAG}" \
-        --mode "${MODE}" \
-        --streaming \
-        -ck ${CK} \
-        -win ${WIN} \
-        -hh ${HH} \
-        -ret_sz ${RET_SZ} \
-        -ret_buf
+        --mode stac
 done

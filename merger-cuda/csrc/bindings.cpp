@@ -174,6 +174,18 @@ PYBIND11_MODULE(_ext, m) {
         .def_property_readonly("valid_pivot_count", &causalvggt::MergerWrapper::valid_pivot_count)
         .def("workspace_bytes", &causalvggt::MergerWrapper::workspace_bytes,
              "Return the current workspace buffer size in bytes.")
+        .def("pool_stats", &causalvggt::MergerWrapper::pool_stats,
+             R"doc(
+             Return voxel pool storage statistics.
+
+             Returns a dict with:
+                 buf_data_count: actual buffer tokens stored (sum of row counts)
+                 buf_alloc_count: total buffer token capacity
+                 buf_used_slots: physical pool slots in use
+                 piv_data_count: actual pivot tokens stored
+                 piv_alloc_count: total pivot token capacity
+                 piv_used_slots: physical pool slots in use
+             )doc")
         .def_property_readonly("buffer_pool_K", &causalvggt::MergerWrapper::buffer_pool_K)
         .def_property_readonly("buffer_pool_V", &causalvggt::MergerWrapper::buffer_pool_V)
         .def_property_readonly("buffer_pool_S", &causalvggt::MergerWrapper::buffer_pool_S)

@@ -76,11 +76,12 @@ Feed-forward 3D models ([STream3R](https://github.com/NIRVANALAN/STream3R), [Str
 ### Attention modes
 
 
-| Mode                   | Streaming | Description                                    |
-| ---------------------- | --------- | ---------------------------------------------- |
-| `full`                 | No        | Full attention (memory ∝ N²)                   |
-| `causal` / `window_kv` | Yes       | Sliding window KV cache                        |
-| `window_chunk_merge`   | Yes       | Chunked window + voxel merge (**recommended**) |
+| Mode                   | Streaming | Description                                         |
+| ---------------------- | --------- | --------------------------------------------------- |
+| `stac`                 | Yes       | **Recommended** preset (= `window_chunk_merge` + default STAC params) |
+| `full`                 | No        | Full attention (memory ∝ N²)                        |
+| `causal` / `window_kv` | Yes       | Sliding window KV cache                             |
+| `window_chunk_merge`   | Yes       | Chunked window + voxel merge (manual param tuning)  |
 
 
 ## Installation
@@ -138,16 +139,8 @@ device = "cuda"
 model = load_model("causalvggt", base_model="stream3r", device=device)
 
 # images: (N, 3, H, W) tensor, pixel values in [0, 1]
-predictions = run_model(
-    model, images, "causalvggt",
-    mode="window_chunk_merge",
-    streaming=True,
-    window_size=4,
-    chunk_size=4,
-    hh_size=2,
-    retrieval_size=2,
-    return_buf=True,       # include retrieved pivots in attention
-)
+# mode="stac" auto-enables streaming + recommended STAC params
+predictions = run_model(model, images, "causalvggt", mode="stac")
 # predictions keys: extrinsic, intrinsic, depth, depth_conf,
 #                   world_points, world_points_conf, timing, merger, ...
 ```
@@ -164,9 +157,13 @@ model = load_model("causalvggt", base_model="streamvggt", device=device)
 `main.py` provides a minimal inference example on a scene folder; eval scripts add dataset loading and metrics. Scene dirs need an `images/` subfolder with `.png` or `.jpg` files.
 
 ```bash
+# --mode stac = window_chunk_merge + streaming + default STAC params (win=4, ck=4, hh=2, ret_sz=2, ret_buf)
 python eval/long_recon/launch.py --output_dir eval_recon --dataset_type NRGBD \
-    --model_name causalvggt --base_model stream3r \
-    --mode window_chunk_merge --streaming -win 4 -ck 4 -hh 2 -ret_sz 2 -ret_buf --save_tag stac
+    --model_name causalvggt --base_model stream3r --mode stac --save_tag stac
+
+# Override individual params if needed:
+python eval/long_recon/launch.py --output_dir eval_recon --dataset_type NRGBD \
+    --model_name causalvggt --base_model stream3r --mode stac -win 8 -hh 4
 ```
 
 ## Data preparation
@@ -185,7 +182,7 @@ Use `--base_model` to switch backbones. Batch run:
 | Video depth       | `bash eval/video_depth/run.sh` | `eval/video_depth/launch.py` && `eval/video_depth/eval_depth.py --align scale` |
 
 
-Common flags: `--model_name causalvggt --base_model stream3r --mode window_chunk_merge --streaming -win 4 -ck 4 -hh 2 -ret_sz 2 -ret_buf`. Eval scripts default to `--voxel_backend cuda` and `--allocator segment`.
+Common flags: `--model_name causalvggt --base_model stream3r --mode stac`. Eval scripts default to `--voxel_backend cuda` and `--allocator segment`.
 
 ## Demos
 

@@ -3,6 +3,7 @@
 from typing import Optional, Tuple, Union, Dict, Literal
 import math
 import os
+import logging
 from collections.abc import Callable
 import torch
 import torch.nn as nn
@@ -13,6 +14,8 @@ from .allocator import (
     BufferInterface, 
     create_buffer,
 )
+
+logger = logging.getLogger(__name__)
 
 _MEM_PROFILE = os.environ.get("MERGER_MEM_PROFILE", "0") == "1"
 
@@ -29,14 +32,14 @@ def _tensor_mb(t: torch.Tensor) -> float:
     return t.nelement() * t.element_size() / (1024 * 1024)
 
 def _mem_checkpoint(label: str, extra: str = ""):
-    """Print a memory checkpoint if MERGER_MEM_PROFILE=1."""
+    """Log a memory checkpoint if MERGER_MEM_PROFILE=1."""
     if not _MEM_PROFILE:
         return
     a, r = _gpu_mem_mb()
     msg = f"  [MEM] {label:40s} | alloc={a:10.1f} MB | reserved={r:10.1f} MB"
     if extra:
         msg += f" | {extra}"
-    print(msg, flush=True)
+    logger.info(msg)
 
 def default_weight_fn(scores: torch.Tensor, sim: torch.Tensor) -> torch.Tensor:
     if scores.shape != sim.shape:
@@ -187,10 +190,10 @@ class VoxelKVMerger:
             _mem_checkpoint("init_cuda_merger:after",
                             f"pool_cap={self.H * self._voxel_alloc}, seg_mode={use_seg}")
             if self.debug:
-                print(f"[VoxelKVMerger] Initialized CUDA MergerWrapper (seg_mode={use_seg})")
+                logger.debug("[VoxelKVMerger] Initialized CUDA MergerWrapper (seg_mode=%s)", use_seg)
         except Exception as e:
             if self.debug:
-                print(f"[VoxelKVMerger] Failed to initialize CUDA MergerWrapper: {e}")
+                logger.debug("[VoxelKVMerger] Failed to initialize CUDA MergerWrapper: %s", e)
             self._stac_merger = None
             raise
 
@@ -1059,9 +1062,9 @@ class VoxelKVMerger:
             E_total = keys_cuda.shape[0]
             concat_mb = (_tensor_mb(keys_cuda) + _tensor_mb(values_cuda)
                          + _tensor_mb(scores_cuda) + _tensor_mb(rows_cuda))
-            print(f"  [MEM-SEG] concat | E_new={E_new}, E_over={E_overflow_old}, E_total={E_total}, "
-                  f"concat_tensors={concat_mb:.1f}MB, "
-                  f"Δalloc={_a1-_a0:+.0f}MB, Δres={_r1-_r0:+.0f}MB", flush=True)
+            logger.info("  [MEM-SEG] concat | E_new=%d, E_over=%d, E_total=%d, "
+                        "concat_tensors=%.1fMB, Δalloc=%+.0fMB, Δres=%+.0fMB",
+                        E_new, E_overflow_old, E_total, concat_mb, _a1-_a0, _r1-_r0)
 
         first_init = self._stac_merger is None
         self._init_cuda_merger()
@@ -1092,8 +1095,8 @@ class VoxelKVMerger:
         if _MEM_PROFILE:
             torch.cuda.synchronize()
             _a4, _r4 = _gpu_mem_mb()
-            print(f"  [MEM-SEG] after_cuda_merge | "
-                  f"Δalloc={_a4-_a1:+.0f}MB, alloc={_a4:.0f}MB, reserved={_r4:.0f}MB", flush=True)
+            logger.info("  [MEM-SEG] after_cuda_merge | Δalloc=%+.0fMB, alloc=%.0fMB, reserved=%.0fMB",
+                        _a4-_a1, _a4, _r4)
 
         self.K_over = K_over
         self.V_over = V_over
@@ -1152,7 +1155,7 @@ class VoxelKVMerger:
         H, Tn, D = K_new.shape
         if Tn == 0:
             if self.debug:
-                print("Warning: no new tokens to insert")
+                logger.warning("No new tokens to insert")
             return defualt_res
         assert H == self.H and D == self.D
         assert V_new.shape == K_new.shape and S_new.shape == I_new.shape == VX_new.shape == (H, Tn)
@@ -1169,7 +1172,7 @@ class VoxelKVMerger:
         valid = (VX_new >= 0) & (VX_new < self._voxel_offset)
         if not valid.any():
             if self.debug:
-                print("Warning: no valid tokens to insert")
+                logger.warning("No valid tokens to insert")
             return defualt_res
         
         head_ids = torch.arange(H, device=K_new.device, dtype=torch.long)[:, None].expand(H, Tn)
@@ -1506,19 +1509,27 @@ class VoxelKVMerger:
 
         return K_out, V_out, M_out, logit_bias_out
 
+    def _pool_counts(self):
+        """Return (buf_data, buf_alloc, piv_data, piv_alloc) token counts.
+
+        Uses CUDA pool_stats() when the CUDA backend is active; otherwise
+        falls back to the Python allocator stats.
+        """
+        if self._stac_merger is not None and hasattr(self._stac_merger, "pool_stats"):
+            ps = self._stac_merger.pool_stats()
+            return (ps["buf_data_count"], ps["buf_alloc_count"],
+                    ps["piv_data_count"], ps["piv_alloc_count"])
+        buf_s = self.buffer.stats()
+        piv_s = self.pivots.stats()
+        return (buf_s.get("data_count", 0), buf_s.get("alloc_count", 1),
+                piv_s.get("data_count", 0), piv_s.get("alloc_count", 1))
+
     def info(self) -> dict:
-        # pivot occupancy & histogram from self.pivots
-        buf_stats = self.buffer.detailed_stats()
-        buf_data_count  = buf_stats.get("data_count", 0)
-        buf_alloc_count = buf_stats.get("alloc_count", 1)
+        buf_data, buf_alloc, piv_data, piv_alloc = self._pool_counts()
+        data_count  = piv_data + buf_data
+        alloc_count = piv_alloc + buf_alloc
 
-        pivot_stats = self.pivots.detailed_stats()
-        pivot_count_total = pivot_stats.get("data_count", 0)
-        pivot_alloc_total = pivot_stats.get("alloc_count", 1)
-        data_count = pivot_count_total + buf_data_count
-        alloc_count = pivot_alloc_total + buf_alloc_count
-
-        merge_compress_ratio = pivot_count_total / float(self._token_count + 1e-6)
+        merge_compress_ratio = piv_data / float(self._token_count + 1e-6)
         best_compress_ratio  = data_count / float(self._token_count + 1e-6)
         real_compress_ratio  = alloc_count / float(self._token_count + 1e-6)
 
@@ -1533,32 +1544,26 @@ class VoxelKVMerger:
             merge_compress_ratio=merge_compress_ratio,
             best_compress_ratio=best_compress_ratio,
             real_compress_ratio=real_compress_ratio,
-            pivot_stats=pivot_stats,
-            pool_stats=buf_stats,
+            pivot_pool_used=piv_data,
+            pivot_pool_alloc=piv_alloc,
+            buffer_pool_used=buf_data,
+            buffer_pool_alloc=buf_alloc,
         )
     
     def memory(self) -> dict:
-        buf_stats = self.buffer.stats()
-        buf_data_count  = buf_stats.get("data_count", 0)
-        buf_alloc_count = buf_stats.get("alloc_count", 1)
+        """Return memory breakdown in MB for buffer and pivot pools."""
+        buf_data, buf_alloc, piv_data, piv_alloc = self._pool_counts()
+        kv_bytes = torch.finfo(self.dtype).bits // 8
 
-        buf_used_mem = buf_data_count * (self.D * 2) * torch.finfo(self.dtype).bits // 8 # K, V
-        buf_used_mem += buf_data_count * (1) * 4 # scores float32
-        buf_alloc_mem = buf_alloc_count * (self.D * 2) * torch.finfo(self.dtype).bits // 8
-        buf_alloc_mem += buf_alloc_count * (1) * 4
-
-        pivot_stats = self.pivots.stats()
-        pivot_count_total = pivot_stats.get("data_count", 0)
-        pivot_alloc_total = pivot_stats.get("alloc_count", 1)
-        pivot_used_mem = pivot_count_total * (self.D * 2) * torch.finfo(self.dtype).bits // 8 # K, V
-        pivot_used_mem += pivot_count_total * (4 + 4) # scores float32 + C int32
-        pivot_alloc_mem = pivot_alloc_total * (self.D * 2) * torch.finfo(self.dtype).bits // 8
-        pivot_alloc_mem += pivot_alloc_total * (4 + 4)
+        buf_used_mem  = buf_data  * (self.D * 2 * kv_bytes + 4)
+        buf_alloc_mem = buf_alloc * (self.D * 2 * kv_bytes + 4)
+        piv_used_mem  = piv_data  * (self.D * 2 * kv_bytes + 4 + 4)
+        piv_alloc_mem = piv_alloc * (self.D * 2 * kv_bytes + 4 + 4)
 
         return dict(
-            buffer_used_mem=buf_used_mem/(1024**2),
-            buffer_alloc_mem=buf_alloc_mem/(1024**2),
-            pivot_used_mem=pivot_used_mem/(1024**2),
-            pivot_alloc_mem=pivot_alloc_mem/(1024**2),
+            buffer_used_mem=buf_used_mem / (1024**2),
+            buffer_alloc_mem=buf_alloc_mem / (1024**2),
+            pivot_used_mem=piv_used_mem / (1024**2),
+            pivot_alloc_mem=piv_alloc_mem / (1024**2),
         )
 

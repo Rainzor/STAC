@@ -8,39 +8,61 @@ from stac.stac_voxel import STACVoxelKV
 from causalvggt.utils.geometry import unproject_depth_map_to_point_map
 from causalvggt.utils.pose_enc import pose_encoding_to_extri_intri
 
-import psutil, os
+import os
 import logging
 import json
 from copy import deepcopy
-from tqdm import tqdm
 import time
 
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+from rich.live import Live
+from rich.table import Table
+from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, MofNCompleteColumn
+from rich.console import Console, Group
+from rich.logging import RichHandler
+
+_console = Console(stderr=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+    handlers=[RichHandler(console=_console, show_path=False, rich_tracebacks=True)],
+)
 logger = logging.getLogger("StreamSession")
 
 VERBOSE = os.environ.get("VERBOSE", "0").strip().lower() in ("1", "true", "yes")
 
 
-def print_mem(tag=""):
-    # ---- GPU Memory ----
+def _make_progress(description: str, total: int) -> tuple:
+    """Create a (Progress, task_id) pair with consistent styling."""
+    progress = Progress(
+        TextColumn("[bold]{task.description}"),
+        BarColumn(bar_width=40),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        TextColumn("•"),
+        TimeRemainingColumn(),
+    )
+    task_id = progress.add_task(description, total=total)
+    return progress, task_id
+
+
+def _stats_table(rows: list[tuple[str, str]]) -> Table:
+    """Build a compact stats Table from (label, value) pairs."""
+    table = Table(show_header=False, box=None, padding=(0, 1))
+    table.add_column(style="bold cyan", width=10)
+    table.add_column()
+    for label, value in rows:
+        table.add_row(label, value)
+    return table
+
+
+def _gpu_mem_mb():
+    """Return (allocated_MB, reserved_MB) for the current CUDA device."""
     if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / 1024**2
-        reserved = torch.cuda.memory_reserved() / 1024**2
-    else:
-        allocated = reserved = 0.0
-
-    # ---- CPU Memory ----
-    process = psutil.Process(os.getpid())
-    mem_info = process.memory_info()
-    rss = mem_info.rss / 1024**2   # (Resident Set Size)
-    vms = mem_info.vms / 1024**2   # (Virtual Memory Size)
-
-    if VERBOSE:
-        print(
-            f"[{tag}] "
-            f"GPU allocated={allocated:.2f}MB, reserved={reserved:.2f}MB | "
-            f"CPU RSS={rss:.2f}MB, VMS={vms:.2f}MB"
-        )
+        return (torch.cuda.memory_allocated() / 1024**2,
+                torch.cuda.memory_reserved() / 1024**2)
+    return 0.0, 0.0
 
 
 class StreamSession:
@@ -272,12 +294,10 @@ class StreamSession:
                 "window_size": window_size,
             })
             kv_kwargs = self.register_kv_mgr(mode, images, KVManager, **kv_kwargs)
-            self.cam_cache_update = False
             self.model.set_camhead(self.cam_cache_update)
             debug_timing = kwargs.get("timing", True)
-            kv_manager_infos = []
-            memory_stats_infos = []
-            with tqdm(total=num_frames, desc="Window mode", dynamic_ncols=True) as pbar:
+            progress, task = _make_progress("Window Mode", num_frames)
+            with Live(progress, console=_console, refresh_per_second=8) as live:
                 for i in range(num_frames):
                     image = images[i : i + 1].to(device=self.device)
                     outputs = self.model(
@@ -298,43 +318,26 @@ class StreamSession:
                     self.pushback_prediction(outputs)
                     self._update_benchmark(outputs.get("timing", {}))
 
-                    info = {"frame_idx": i}
                     kvcache_info = self.model.aggregator.get_kv_mgr_info()
-                    info.update(kvcache_info)
-                    kv_manager_infos.append(info)
-
-                    pbar.update(1)
                     kvcache_size = kvcache_info["kvcache_size"][0]
                     kvcache_mem = kvcache_info["kvcache_used"]
 
-                    stats = {
-                        "frame_idx": i,
-                        "kvcache_size": kvcache_size,
-                        "kvcache_mem": kvcache_mem,
-                    }
-                    total_time = 0.0
-                    for k,v in timing.items():
-                        stats[k] = v
-                        total_time += v
-                    stats["total_time"] = total_time
-                    memory_stats_infos.append(stats)
-
-                    if torch.cuda.is_available():
-                        allocated = torch.cuda.memory_allocated() / 1024**2
-                        reserved = torch.cuda.memory_reserved() / 1024**2
-                    else:
-                        allocated = reserved = 0.0
                     agg_time = timing.get("aggregator_infer_time", 0)
                     prune_time = timing.get("kv_pruning_time", 0)
-                    pbar.set_postfix({
-                        "Time(agg/prune)": f"{agg_time:.2f}/{prune_time:.2f}",
-                        "KV used": f"{kvcache_size}",
-                        "GPU(KV/A/R)": f"{kvcache_mem:.0f}/{allocated:.0f}/{reserved:.0f}MB",
-                    })
+                    allocated, reserved = _gpu_mem_mb()
 
+                    progress.update(task, advance=1)
+                    live.update(Group(
+                        progress,
+                        _stats_table([
+                            ("Time(ms)", f"agg={agg_time:.1f}  prune={prune_time:.1f}"),
+                            ("KV Cache", f"tokens={kvcache_size}  mem={kvcache_mem:.0f}MB"),
+                            ("GPU(MB)", f"alloc={allocated:.0f}  reserved={reserved:.0f}"),
+                        ]),
+                    ))
                     self._processed_frames += 1
             if VERBOSE:
-                print("Window mode Done!")
+                logger.info("Window mode done.")
 
         elif mode in ["window_chunk_merge"]:
             # Use Voxel attention to maintain a voxel + recent KV cache for the aggregator.
@@ -383,20 +386,15 @@ class StreamSession:
             ret_size = kv_kwargs.get("retrieval_size", -1)
             buffer_size = kv_kwargs.get("buffer_size", 16)
 
-            self.cam_cache_update = False
             self.model.set_camhead(self.cam_cache_update)
 
             conf_threshold = kwargs.get("conf_threshold", 2.0)
-            logger.info(f"VoxelSasaMerge chunk mode with chunk_size {chunk_size} and window_size {window_size}, conf_threshold {conf_threshold}.")
+            logger.info("STAC chunk-merge: chunk=%d, window=%d, conf_threshold=%.1f",
+                        chunk_size, window_size, conf_threshold)
             special_tokens_size = self.model.aggregator.patch_start_idx
-
-            export_metrics = kwargs.get("export_metrics", False)
-            export_metrics_dir = kwargs.get("export_metrics_dir", "./eval_results/step_metrics")
             
-            kv_manager_infos = []
-            memory_stats_infos = []
-            step_metrics_list = []  # For JSON export
-            with tqdm(total=num_frames, desc=f"{mode} mode") as pbar:
+            progress, task = _make_progress("STAC Mode", num_frames)
+            with Live(progress, console=_console, refresh_per_second=8) as live:
                 for frame_idx in range(0, num_frames, chunk_size):
                     frame_buffer = images[frame_idx : min(frame_idx + chunk_size, num_frames)].to(device=self.device)
                     frame_buffer_size = frame_buffer.shape[0]
@@ -415,7 +413,6 @@ class StreamSession:
                     else:
                         pose_enc = outputs["pose_enc"]
 
-                    # update kv manager position with confident points
                     pts3d, valid_mask = self.get_pointmap(outputs, conf_threshold=conf_threshold, 
                                                           special_tokens_size=special_tokens_size,
                                                           pose_enc = pose_enc, images=frame_buffer
@@ -423,7 +420,6 @@ class StreamSession:
                     kv_pos_time = self.model.aggregator.update_kv_mgr_pos(pts3d, valid_mask, timing=debug_timing)
                     timing["kv_position_time"] = kv_pos_time
 
-                    # retrieve from voxel grid
                     retrieval_time = 0.0
                     if frame_idx > max(buffer_size, 16):
                         if ret_size > 0:
@@ -439,14 +435,9 @@ class StreamSession:
 
                     timing["kv_retrieval_time"] = retrieval_time
 
-                    # prune kv cache according to heavy-hitter + recent scheme
                     prune_merge_time = self.model.aggregator.prune_kv_mgr(timing=debug_timing)
                     timing["kv_prune_merge_time"] = prune_merge_time
 
-                    # Reclaim fragmented reserved memory periodically to prevent OOM.
-                    # The merge pipeline creates large transient fp32/bf16 tensors that
-                    # fragment the CUDA caching allocator; without periodic cleanup,
-                    # reserved memory grows unbounded (~5 GB on a 24 GB GPU).
                     if frame_idx % (chunk_size * 4) == 0 or frame_idx >= num_frames - chunk_size:
                         _mem_profile = os.environ.get("MERGER_MEM_PROFILE", "0") == "1"
                         if _mem_profile:
@@ -459,21 +450,19 @@ class StreamSession:
                             r_after = torch.cuda.memory_reserved() / (1024**2)
                             frag_after = r_after - a_before
                             freed = r_before - r_after
-                            print(f"  [MEM-FRAG] frame={frame_idx} | "
-                                  f"alloc={a_before:.0f}MB, "
-                                  f"res_before={r_before:.0f}MB, res_after={r_after:.0f}MB, "
-                                  f"frag_before={frag_before:.0f}MB, frag_after={frag_after:.0f}MB, "
-                                  f"freed_by_empty_cache={freed:.0f}MB", flush=True)
+                            logger.debug(
+                                "  [MEM-FRAG] frame=%d | alloc=%.0fMB, "
+                                "res_before=%.0fMB, res_after=%.0fMB, "
+                                "frag_before=%.0fMB, frag_after=%.0fMB, "
+                                "freed_by_empty_cache=%.0fMB",
+                                frame_idx, a_before, r_before, r_after,
+                                frag_before, frag_after, freed,
+                            )
 
                     self.pushback_prediction(outputs)
                     self._update_benchmark(timing)
 
-                    # logging kv manager info
-                    info = {"frame_idx": frame_idx}
                     kvcache_info = self.model.aggregator.get_kv_mgr_info()
-                    info.update(kvcache_info)
-                    kv_manager_infos.append(info)
-
                     merger_stat = kv_manager.get_merger_info()
                     merger_stat["frame_idx"] = frame_idx
                     total_time = 0.0
@@ -482,157 +471,34 @@ class StreamSession:
                         total_time += value
                     merger_stat["total_time"] = total_time / frame_buffer_size
 
-                    memory_stats_infos.append(merger_stat)
+                    allocated, reserved = _gpu_mem_mb()
 
-                    if export_metrics:
-                        memory_details = kv_manager.get_memory_details()
-                        step_metric = {
-                            "step": frame_idx // chunk_size,
-                            "frame_idx": frame_idx,
-                            "chunk_size": frame_buffer_size,
-                            "timing": {
-                                "aggregator_infer_time": timing.get("aggregator_infer_time", 0) / frame_buffer_size,
-                                "kv_position_time": timing.get("kv_position_time", 0) / frame_buffer_size,
-                                "kv_retrieval_time": timing.get("kv_retrieval_time", 0) / frame_buffer_size,
-                                "kv_prune_merge_time": timing.get("kv_prune_merge_time", 0) / frame_buffer_size,
-                                "total_time": total_time / frame_buffer_size,
-                            },
-                            # Memory usage (MB) - detailed breakdown
-                            "memory": {
-                                # Hot cache components
-                                "pinned_memory": float(memory_details.get("pinned_memory", 0)),
-                                "window_memory": float(memory_details.get("window_memory", 0)),
-                                "heavy_hitters_memory": float(memory_details.get("heavy_hitters_memory", 0)),
-                                "retrieval_memory": float(memory_details.get("retrieval_memory", 0)),
-                                # Voxel store components
-                                "voxel_buffer_usage": float(memory_details.get("voxel_buffer_usage", 0)),
-                                "voxel_buffer_alloc": float(memory_details.get("voxel_buffer_alloc", 0)),
-                                "voxel_pivot_usage": float(memory_details.get("voxel_pivot_usage", 0)),
-                                "voxel_pivot_alloc": float(memory_details.get("voxel_pivot_alloc", 0)),
-                                # Hot cache totals
-                                "hot_cache_usage": float(memory_details.get("hot_cache_usage", 0)),
-                                "hot_cache_alloc": float(memory_details.get("hot_cache_alloc", 0)),
-                                # Grand totals
-                                "total_usage": float(memory_details.get("total_usage", 0)),
-                                "total_alloc": float(memory_details.get("total_alloc", 0)),
-                            },
-                            # KV cache info
-                            "kv_cache": {
-                                "kvcache_size": kvcache_info.get("kvcache_size", [0])[0] if isinstance(kvcache_info.get("kvcache_size", [0]), list) else kvcache_info.get("kvcache_size", 0),
-                                "retrieval_size": int(np.mean(kvcache_info.get("retrieval_size", [0]))) if kvcache_info.get("retrieval_size") else 0,
-                            },
-                            # Merger stats (flatten for readability)
-                            "merger": {
-                                "num_voxels": merger_stat.get("used_voxels", 0),
-                                "token_count": merger_stat.get("token_count", 0),
-                                "best_compress_ratio": merger_stat.get("best_compress_ratio", 1.0),
-                                "real_compress_ratio": merger_stat.get("real_compress_ratio", 1.0),
-                                "pivot_pool_used": merger_stat.get("pivot_pool_used", 0),
-                                "buffer_pool_used": merger_stat.get("buffer_pool_used", 0),
-                            },
-                        }
-                        step_metrics_list.append(step_metric)
-                    
-
-                    kvcache_size = kvcache_info["kvcache_size"][0]
-                    retrieval_size_list = kvcache_info.get("retrieval_size", None)
-                    retrieval_size = 0
-                    if retrieval_size_list is not None:
-                        retrieval_size = int(np.mean(retrieval_size_list))
-                    if torch.cuda.is_available():
-                        allocated = torch.cuda.memory_allocated() / 1024**2
-                        reserved = torch.cuda.memory_reserved() / 1024**2
-                    else:
-                        allocated = reserved = 0.0
-                    agg_time = timing.get("aggregator_infer_time", 0) / frame_buffer_size
-                    kv_pos_time = kv_pos_time / frame_buffer_size
-                    prune_merge_time = prune_merge_time / frame_buffer_size
-                    retrieval_time = retrieval_time / frame_buffer_size
+                    agg_t = timing.get("aggregator_infer_time", 0) / frame_buffer_size
+                    pos_t = kv_pos_time / frame_buffer_size
+                    mrg_t = prune_merge_time / frame_buffer_size
+                    ret_t = retrieval_time / frame_buffer_size
 
                     mem_details = kv_manager.get_memory_details()
-                    hot_mem = mem_details.get("hot_cache_usage", 0)
-                    voxel_mem = mem_details.get("voxel_buffer_usage", 0) + mem_details.get("voxel_pivot_usage", 0)
-                    ret_mem = mem_details.get("retrieval_memory", 0)
+                    hot_mem   = mem_details.get("hot_cache_usage", 0)
+                    vox_used  = (mem_details.get("voxel_buffer_usage", 0)
+                                 + mem_details.get("voxel_pivot_usage", 0))
+                    vox_alloc = (mem_details.get("voxel_buffer_alloc", 0)
+                                 + mem_details.get("voxel_pivot_alloc", 0))
+                    ret_mem   = mem_details.get("retrieval_memory", 0)
 
-                    pbar_info = f"Time(agg/pos/prune&merge/ret):{agg_time:.2f}/{kv_pos_time:.2f}/{prune_merge_time:.2f}/{retrieval_time:.2f}, KV(hot/ret)={kvcache_size}/{retrieval_size},Mem(H/V/R/A/R)={hot_mem:.0f}/{voxel_mem:.0f}/{ret_mem:.0f}/{allocated:.0f}/{reserved:.0f}MB"
-                    if VERBOSE and ((frame_idx // chunk_size + 1) % max(1, window_size // chunk_size) == 0 or (frame_idx + frame_buffer_size) >= num_frames):
-                        print(f"==== VoxelSasaMerge: Frame {frame_idx + frame_buffer_size}, {pbar_info} =========================")
-                    pbar.set_postfix_str(pbar_info)
-                    pbar.update(frame_buffer_size)
+                    progress.update(task, advance=frame_buffer_size)
+                    live.update(Group(
+                        progress,
+                        _stats_table([
+                            ("Time(ms)", f"agg={agg_t:.1f}  pos={pos_t:.1f}  merge={mrg_t:.1f}  ret={ret_t:.1f}"),
+                            ("Mem(MB)", f"hot={hot_mem:.0f}  vox(used/alloc)={vox_used:.0f}/{vox_alloc:.0f}  ret={ret_mem:.0f}"),
+                            ("GPU(MB)", f"allocated={allocated:.0f}  reserved={reserved:.0f}"),
+                        ]),
+                    ))
                     self._processed_frames += frame_buffer_size
             if VERBOSE:
-                print("Chunk VoxelSasaMerge mode Done!")
+                logger.info("STAC chunk-merge mode done.")
 
-            tag = kwargs.get("tag", "voxel_merge")
-            # Export step-level metrics to JSON
-            if export_metrics and step_metrics_list:
-                os.makedirs(export_metrics_dir, exist_ok=True)
-                timestamp = time.strftime("%Y%m%d_%H%M%S")
-                json_filename = f"{tag}_f{num_frames}_step_metrics_{timestamp}.json"
-                json_path = os.path.join(export_metrics_dir, json_filename)
-                
-                # Build summary statistics
-                timing_keys = ["aggregator_infer_time", "kv_position_time", "kv_retrieval_time", "kv_prune_merge_time", "total_time"]
-                memory_keys = [
-                    # Hot cache components
-                    "pinned_memory", "window_memory", "heavy_hitters_memory", "retrieval_memory",
-                    # Voxel store components
-                    "voxel_buffer_usage", "voxel_buffer_alloc", "voxel_pivot_usage", "voxel_pivot_alloc",
-                    # Hot cache totals
-                    "hot_cache_usage", "hot_cache_alloc",
-                    # Grand totals
-                    "total_usage", "total_alloc",
-                ]
-                
-                timing_summary = {}
-                for k in timing_keys:
-                    values = [s["timing"][k] for s in step_metrics_list]
-                    timing_summary[k] = {
-                        "mean": float(np.mean(values)),
-                        "std": float(np.std(values)),
-                        "min": float(np.min(values)),
-                        "max": float(np.max(values)),
-                    }
-                
-                memory_summary = {}
-                for k in memory_keys:
-                    values = [s["memory"][k] for s in step_metrics_list]
-                    memory_summary[k] = {
-                        "mean": float(np.mean(values)),
-                        "std": float(np.std(values)),
-                        "min": float(np.min(values)),
-                        "max": float(np.max(values)),
-                    }
-                
-                export_data = {
-                    "metadata": {
-                        "tag": tag,
-                        "num_frames": num_frames,
-                        "chunk_size": chunk_size,
-                        "window_size": window_size,
-                        "voxel_size": voxel_size,
-                        "sim_threshold": sim_threshold,
-                        "conf_threshold": conf_threshold,
-                        "timestamp": timestamp,
-                    },
-                    "hyperparameters": merger_kwargs,
-                    "summary": {
-                        "timing": timing_summary,
-                        "memory": memory_summary,
-                        "total_steps": len(step_metrics_list),
-                    },
-                    "steps": step_metrics_list,
-                }
-                
-                with open(json_path, "w", encoding="utf-8") as f:
-                    json.dump(export_data, f, indent=2, ensure_ascii=False)
-                logger.info(f"Exported step-level metrics to {json_path}")
-
-            if merge_layers is None:
-                layer_list = list(range(self.aggregator_kv_cache_depth))
-            else:
-                layer_list = merge_layers
-            
             voxel_merge_stats = {}
             kv_mgr = self.model.aggregator.kv_manager
             if hasattr(kv_mgr, "get_merger_info"):

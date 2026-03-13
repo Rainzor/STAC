@@ -1,5 +1,6 @@
 # Copyright (c) 2025 STAC Authors. All rights reserved.
 
+import logging
 from typing import List, Optional, Tuple, Dict, Callable
 import os
 import torch
@@ -9,6 +10,8 @@ from .h2o import HeavyHittersKV
 from .flash_attn_triton import fa_forward_colsum_fast
 from .voxel import BinaryVoxel
 from .merger import VoxelKVMerger, _MEM_PROFILE, _gpu_mem_mb, _tensor_mb
+
+logger = logging.getLogger(__name__)
 
 
 class STACVoxelKV(HeavyHittersKV):
@@ -109,14 +112,27 @@ class STACVoxelKV(HeavyHittersKV):
         cpu_offload_str = ""
         if enable_alloc_cpu:
             cpu_offload_str = f"\ncpu_offload: enabled, threshold={gpu_threshold_gb}GB"
-        
-        print(
-            f"[Register STACVoxelKV] (layers={self.num_layers}) "
-            f"voxel_size={voxel_size}, pivot_cap={voxel_piv_cap}, buf_cap={voxel_buf_cap}, \n"
-            f"merge_trigger=sim>{sim_threshold}/replace<{replace_threshold}/score>{score_threshold} "
-            f"retrieval_size={retrieval_size}\n"
-            f"slab_pool: allocator={allocator}, growth={slab_growth}, free_policy={slab_free_policy}, cap={slab_cap}, seg_size={seg_size}"
-            f"{cpu_offload_str}"
+        self._stac_cpu_offload_str = cpu_offload_str
+
+        self._log_registration()
+
+    def _log_registration(self) -> None:
+        super()._log_registration()
+        logger.info(
+            "[STACVoxelKV] retrieval=%dx%d  voxel_size=%.3f  pivot_cap=%d  buf_cap=%d",
+            self.recent_size, self.token_per_f, self._voxel_size.item(),
+            self._vk_conf["pivot_cap"], self._vk_conf["budget_cap"],
+        )
+        logger.info(
+            "  merge: sim>%.2f  replace<%.2f  score>%.2f",
+            self._vk_conf["sim_thresh"], self._vk_conf["replace_thresh"],
+            self._vk_conf["score_thresh"],
+        )
+        logger.info(
+            "  pool: allocator=%s  growth=%d  cap=%d  seg=%d%s",
+            self._vk_conf["allocator"], self._vk_conf["slab_growth"],
+            self._vk_conf["slab_cap"], self._vk_conf["seg_size"],
+            getattr(self, "_stac_cpu_offload_str", ""),
         )
 
     # ------------------------
@@ -332,19 +348,6 @@ class STACVoxelKV(HeavyHittersKV):
             voxel_id_batch.view(1, 1, -1).expand(self._L_eff, self.num_heads, -1)
         )
         for l in range(self._L_eff):
-            # if not self._voxelize_list[l]:
-            #     continue
-            # old_T = self._offset_voxel[l]
-            # kv_T  = self._offset_hot[l]
-            # total_T_expected = old_T + T_new
-            # assert kv_T == total_T_expected, (
-            #     f"[STACVoxelKV:L{l}] size mismatch: hot_T={kv_T} vs voxel_written={total_T_expected}; "
-            #     f"ensure append_kv -> append_positions"
-            # )
-            # # broadcast to [H,T_new]
-            # self._token_voxel_indices[l][:, old_T:total_T_expected].copy_(
-            #     voxel_id_batch.view(1, -1).expand(self.num_heads, -1)
-            # )
             self._offset_voxel[l] = total_T_expected
             slot_idx = l
         
@@ -370,7 +373,7 @@ class STACVoxelKV(HeavyHittersKV):
             self._vstore.step_frame()
             n_evicted = self._vstore.check_and_evict()
             if self.debug and n_evicted > 0:
-                print(f"[STACVoxelKV] Evicted {n_evicted} buffer rows to CPU")
+                logger.debug("[STACVoxelKV] Evicted %d buffer rows to CPU", n_evicted)
 
     def _apply_keep_and_compact(self, slot_idx: int, keep_idx_h: torch.Tensor):
         """
@@ -446,8 +449,8 @@ class STACVoxelKV(HeavyHittersKV):
             a1, r1 = _gpu_mem_mb()
             drop_mb = (_tensor_mb(K_drop) + _tensor_mb(V_drop) + _tensor_mb(S_drop)
                        + _tensor_mb(I_drop) + _tensor_mb(VX_drop))
-            print(f"  [MEM-PHASE] pool_drops:extract | T_d={T_d}, drop_tensors={drop_mb:.1f}MB, "
-                  f"Δalloc={a1-a0:+.0f}MB, Δres={r1-r0:+.0f}MB", flush=True)
+            logger.debug("  [MEM-PHASE] pool_drops:extract | T_d=%d, drop_tensors=%.1fMB, "
+                         "Δalloc=%+.0fMB, Δres=%+.0fMB", T_d, drop_mb, a1-a0, r1-r0)
         # write to voxel pool (segment-parallel append + trigger merge)
 
         num_voxels = self._vm.get_voxel_keys().shape[0]  # current valid voxel count
@@ -480,10 +483,11 @@ class STACVoxelKV(HeavyHittersKV):
             over_new = vs.rows_over.numel()
             over_mb_new = (_tensor_mb(vs.K_over) + _tensor_mb(vs.V_over)
                           + _tensor_mb(vs.S_over) + _tensor_mb(vs.rows_over))
-            print(f"  [MEM-PHASE] insert_and_merge | E_in={L*H*T_d}, "
-                  f"overflow_out={over_new} ({over_mb_new:.1f}MB), "
-                  f"Δalloc={a_post-a_pre:+.0f}MB, Δres={r_post-r_pre:+.0f}MB, "
-                  f"alloc={a_post:.0f}MB, reserved={r_post:.0f}MB", flush=True)
+            logger.debug("  [MEM-PHASE] insert_and_merge | E_in=%d, "
+                         "overflow_out=%d (%.1fMB), Δalloc=%+.0fMB, Δres=%+.0fMB, "
+                         "alloc=%.0fMB, reserved=%.0fMB",
+                         L*H*T_d, over_new, over_mb_new,
+                         a_post-a_pre, r_post-r_pre, a_post, r_post)
 
         # Free drop tensors to reclaim transient memory
         del K_drop, V_drop, S_drop, I_drop, VX_drop
@@ -492,18 +496,14 @@ class STACVoxelKV(HeavyHittersKV):
         if _MEM_PROFILE:
             torch.cuda.synchronize()
             a_after_del, r_after_del = _gpu_mem_mb()
-            print(f"  [MEM-PHASE] after_del_drops  | "
-                  f"Δalloc={a_after_del-a_post:+.0f}MB, alloc={a_after_del:.0f}MB, "
-                  f"reserved={r_after_del:.0f}MB", flush=True)
+            logger.debug("  [MEM-PHASE] after_del_drops  | Δalloc=%+.0fMB, alloc=%.0fMB, "
+                         "reserved=%.0fMB", a_after_del-a_post, a_after_del, r_after_del)
 
         if self.debug:
             
-            print(f"[STACVoxelKV: Pooled {T_d} dropped tokens into VoxelKVStore; "
-                      f"Current voxel count: {num_voxels}; "
-                      f"Insert+Merge time: "
-                )
-            for k, v in insert_merge_time.items():
-                    print(f"    {k}: {v:.3f} ms")
+            timing_str = ", ".join(f"{k}: {v:.3f}ms" for k, v in insert_merge_time.items())
+            logger.debug("[STACVoxelKV] Pooled %d tokens, voxels=%d, timing: %s",
+                         T_d, num_voxels, timing_str)
         
         if _MEM_PROFILE:
             torch.cuda.synchronize()
@@ -562,26 +562,19 @@ class STACVoxelKV(HeavyHittersKV):
             except Exception:
                 pass
 
-            print(f"  [MEM-SUMMARY] voxels={num_voxels}, V_alloc={vs._voxel_alloc}, "
-                  f"overflow={vs.rows_over.numel()} ({over_mb:.1f}MB), "
-                  f"KV_hot={kv_hot_mb:.1f}MB, "
-                  f"GPU alloc={a:.0f}MB reserved={r:.0f}MB",
-                  flush=True)
+            logger.debug("  [MEM-SUMMARY] voxels=%d, V_alloc=%d, overflow=%d (%.1fMB), "
+                         "KV_hot=%.1fMB, GPU alloc=%.0fMB reserved=%.0fMB",
+                         num_voxels, vs._voxel_alloc, vs.rows_over.numel(),
+                         over_mb, kv_hot_mb, a, r)
             explained_total = (kv_hot_mb + voxel_table_mb + py_piv_mb + py_buf_mb
                               + ret_cache_mb + tvx_mb + cuda_ws_mb + cuda_seg_mb + over_mb)
-            print(f"  [MEM-DETAIL] "
-                  f"voxel_table={voxel_table_mb:.2f}MB, "
-                  f"py_piv={py_piv_mb:.1f}MB, py_buf={py_buf_mb:.1f}MB, "
-                  f"ret_cache={ret_cache_mb:.1f}MB, "
-                  f"tvx_idx={tvx_mb:.1f}MB, "
-                  f"cuda_ws={cuda_ws_mb:.1f}MB, "
-                  f"cuda_seg_pool={cuda_seg_mb:.1f}MB, "
-                  f"overflow={over_mb:.1f}MB, "
-                  f"explained={explained_total:.1f}MB, "
-                  f"total_alloc={a:.0f}MB, "
-                  f"unexplained={a - explained_total:+.0f}MB, "
-                  f"frag(res-alloc)={r - a:.0f}MB",
-                  flush=True)
+            logger.debug("  [MEM-DETAIL] voxel_table=%.2fMB, py_piv=%.1fMB, py_buf=%.1fMB, "
+                         "ret_cache=%.1fMB, tvx_idx=%.1fMB, cuda_ws=%.1fMB, "
+                         "cuda_seg_pool=%.1fMB, overflow=%.1fMB, explained=%.1fMB, "
+                         "total_alloc=%.0fMB, unexplained=%+.0fMB, frag(res-alloc)=%.0fMB",
+                         voxel_table_mb, py_piv_mb, py_buf_mb, ret_cache_mb, tvx_mb,
+                         cuda_ws_mb, cuda_seg_mb, over_mb, explained_total,
+                         a, a - explained_total, r - a)
        
 
     def _pool_drops_vectorized(self, slot_idx: int, all_keep_tokens: torch.Tensor, device: torch.device):
@@ -647,12 +640,9 @@ class STACVoxelKV(HeavyHittersKV):
             first_layer = torch.nonzero(torch.tensor(self._voxelize_list), as_tuple=False)[0].item()
             
             if layer_idx == first_layer and self._processed_frames % 10 == 0:
-                print(f"[STACVoxelKV:L{layer_idx}] Pooled {T_d} dropped tokens into VoxelKVStore; "
-                      f"Current voxel count: {num_voxels}; "
-                      f"Insert+Merge time: "
-                )
-                for k, v in insert_merge_time.items():
-                    print(f"    {k}: {v:.3f} ms")
+                timing_str = ", ".join(f"{k}: {v:.3f}ms" for k, v in insert_merge_time.items())
+                logger.debug("[STACVoxelKV:L%d] Pooled %d tokens, voxels=%d, timing: %s",
+                             layer_idx, T_d, num_voxels, timing_str)
 
     def retrieve_kv(self, layer_idx, **kwargs):
         slot_idx = self._to_slot(layer_idx)
@@ -696,9 +686,9 @@ class STACVoxelKV(HeavyHittersKV):
 
         if _MEM_PROFILE:
             a, r = _gpu_mem_mb()
-            print(f"  [MEM] retrieve_kv_parallel:before  | Q_voxels={voxel_ids.numel()}, "
-                  f"ret_size={self.retrieval_token_size}, alloc={a:.0f}MB reserved={r:.0f}MB",
-                  flush=True)
+            logger.debug("  [MEM] retrieve_kv_parallel:before  | Q_voxels=%d, "
+                         "ret_size=%d, alloc=%.0fMB reserved=%.0fMB",
+                         voxel_ids.numel(), self.retrieval_token_size, a, r)
 
         K_ret, V_ret, M_ret, B_ret = self._vstore.retrieve(
             voxel_ids=voxel_ids,
@@ -709,9 +699,9 @@ class STACVoxelKV(HeavyHittersKV):
         if _MEM_PROFILE:
             a, r = _gpu_mem_mb()
             ret_mb = _tensor_mb(K_ret) + _tensor_mb(V_ret) + _tensor_mb(M_ret) + _tensor_mb(B_ret)
-            print(f"  [MEM] retrieve_kv_parallel:after   | out_shape={list(K_ret.shape)}, "
-                  f"ret_tensors={ret_mb:.1f}MB, alloc={a:.0f}MB reserved={r:.0f}MB",
-                  flush=True)
+            logger.debug("  [MEM] retrieve_kv_parallel:after   | out_shape=%s, "
+                         "ret_tensors=%.1fMB, alloc=%.0fMB reserved=%.0fMB",
+                         list(K_ret.shape), ret_mb, a, r)
         #TODO:
         for slot_idx in range(L):
             if not self._voxelize_list[slot_idx]:
@@ -725,8 +715,8 @@ class STACVoxelKV(HeavyHittersKV):
             if Tm == 0:
                 if self.debug:
                     layer_idx = self._managed_layers[slot_idx]
-                    print(f"[STACVoxelKV:L{layer_idx}] No pivots retrieved from VoxelKVStore.")
-                    print(f" K_ret shape: {K_ret.shape}, retrieval_token_size: {self.retrieval_token_size}")
+                    logger.debug("[STACVoxelKV:L%d] No pivots retrieved, K_ret=%s, ret_size=%d",
+                                 layer_idx, K_ret.shape, self.retrieval_token_size)
                 continue
             
             # resize cache
@@ -755,9 +745,8 @@ class STACVoxelKV(HeavyHittersKV):
         if _MEM_PROFILE:
             torch.cuda.synchronize()
             a_end, r_end = _gpu_mem_mb()
-            print(f"  [MEM] retrieve_kv_parallel:done    | "
-                  f"alloc={a_end:.0f}MB reserved={r_end:.0f}MB "
-                  f"(after del K/V/M/B_ret)", flush=True)
+            logger.debug("  [MEM] retrieve_kv_parallel:done    | alloc=%.0fMB reserved=%.0fMB "
+                         "(after del K/V/M/B_ret)", a_end, r_end)
 
         return max_wrote, total_wrote
 
@@ -817,8 +806,8 @@ class STACVoxelKV(HeavyHittersKV):
             
         if Tm == 0:
             if self.debug:
-                print(f"[STACVoxelKV:L{layer_idx}] No pivots retrieved from VoxelKVStore.")
-                print(f" K_ret shape: {K_ret.shape}, retrieval_token_size: {self.retrieval_token_size}")
+                logger.debug("[STACVoxelKV:L%d] No pivots retrieved, K_ret=%s, ret_size=%d",
+                             layer_idx, K_ret.shape, self.retrieval_token_size)
             return 0, 0
         
         # resize cache

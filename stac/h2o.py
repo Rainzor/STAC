@@ -1,5 +1,6 @@
 # Copyright (c) 2025 STAC Authors. All rights reserved.
 
+import logging
 from typing import List, Optional, Tuple
 import torch
 import torch.nn.functional as F
@@ -7,6 +8,8 @@ import numpy as np
 import warnings
 from .kv_manager import KVManager
 from .flash_attn_triton import fa_forward_colsum_fast
+
+logger = logging.getLogger(__name__)
 
 
 class HeavyHittersKV(KVManager):
@@ -46,12 +49,18 @@ class HeavyHittersKV(KVManager):
         self.cache_token_size   = int(self.cache_size * self.token_per_f)
         self.hot_token_size     = int(self.hot_size * self.token_per_f)
 
-        print(f"[Register H2OKV] (layer number {self._L_eff}/{self.num_layers}): buffer_size={self.reserved_buffer_size}, hh_size={self.hh_size}, temperature={self.temperature}")
-
         self._scores_hot: Optional[torch.Tensor] =  None  # List of [H, buffer_T] tensors
         self._scores_hot_count: Optional[torch.Tensor] = None  # List of [H, buffer_T] tensors
         self._last_score_offset = None # List of int
         self._last_query_offset = None
+
+        if type(self) is HeavyHittersKV:
+            self._log_registration()
+
+    def _log_registration(self) -> None:
+        super()._log_registration()
+        logger.info("[H2OKV] anchor tok=%dx%d  temperature=%.2f",
+                    self.hh_size, self.token_per_f, self.temperature)
 
     #------ Utility functions ------
     def _estimate_scores(self, slot_idx: int, T_live: int) -> torch.Tensor:
@@ -200,7 +209,7 @@ class HeavyHittersKV(KVManager):
         try:
             self._parallel_prune_kv()
         except RuntimeError as e:
-            print(f"Parallel prune failed: {e}. Falling back to per-slot prune.")
+            logger.warning("Parallel prune failed: %s. Falling back to per-slot prune.", e)
             raise RuntimeError("Falling back to per-slot prune is not supported anymore.")
             # for slot_idx in range(self._L_eff):
             #     self._prune_kv(slot_idx)

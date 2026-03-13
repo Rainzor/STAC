@@ -67,6 +67,16 @@ def load_model(model_name, base_model='stream3r', device='cuda'):
 
     return model
 
+STAC_DEFAULTS = {
+    "window_size": (4, 0),
+    "chunk_size": (4, 1),
+    "hh_size": (2, 0),
+    "retrieval_size": (2, 0),
+    "return_buf": (True, False),
+    "voxel_backend": ("cuda", "python"),
+    "allocator": ("segment", "slab"),
+}
+
 def run_model(model, images, model_name, mode='full',
               streaming=False, dtype=torch.bfloat16, device='cuda', 
               **kwargs
@@ -74,12 +84,23 @@ def run_model(model, images, model_name, mode='full',
     if model_name != "causalvggt":
         raise NotImplementedError(f"Model '{model_name}' not supported. Only 'causalvggt' is supported.")
 
+    if mode == "stac":
+        mode = "window_chunk_merge"
+        streaming = True
+        for k, (stac_val, argparse_default) in STAC_DEFAULTS.items():
+            if kwargs.get(k, argparse_default) == argparse_default:
+                kwargs[k] = stac_val
+        logger.info(f"Mode 'stac' expanded: mode=window_chunk_merge, streaming=True, "
+                     f"win={kwargs.get('window_size')}, ck={kwargs.get('chunk_size')}, "
+                     f"hh={kwargs.get('hh_size')}, ret_sz={kwargs.get('retrieval_size')}, "
+                     f"ret_buf={kwargs.get('return_buf')}")
+
     processed_frames = images.shape[0]
     if streaming:
         logger.info("Using streaming mode for CausalVGGT.")
         if mode == "full":
             logger.warning("Warning: you are trying to use 'full' attention mode with streaming, which will cause high memory usage.")
-        cam_cache_update = kwargs.get("cam_cache_update", True)
+        cam_cache_update = kwargs.get("cam_cache_update", False)
         kwargs.pop("cam_cache_update", None)
         session: StreamSession = stream_sessions[model_name](
             model, device=device, cam_cache_update=cam_cache_update)
@@ -93,7 +114,7 @@ def run_model(model, images, model_name, mode='full',
         for k in benchmark_metrics:
             benchmark_metrics[k] = benchmark_metrics[k] / processed_frames
             total_time += benchmark_metrics[k]
-            logger.info(f" Average {k} time per frame: {benchmark_metrics[k]:.2f}ms")
+            logger.info(f" Average {k} time per frame: {benchmark_metrics[k]:.2f} ms")
         logger.info(f"Total average time per frame: {total_time:.2f}ms, FPS: {1000/total_time:.1f} ")
         benchmark_metrics["infer_fps"] = 1000.0 / total_time if total_time > 0 else 0
         predictions["timing"] = benchmark_metrics
@@ -110,7 +131,7 @@ def run_model(model, images, model_name, mode='full',
             benchmark_metrics[k] = benchmark_metrics[k] / processed_frames
             total_time += benchmark_metrics[k]
             logger.info(f" Average {k} time per frame: {benchmark_metrics[k]:.2f}ms")
-        logger.info(f"Total average time per frame: {total_time:.2f}ms, FPS: {1000/total_time:.1f} ")
+        logger.info(f"Total average time per frame: {total_time:.2f} ms, FPS: {1000/total_time:.1f} ")
         benchmark_metrics["infer_fps"] = 1000.0 / total_time if total_time > 0 else 0
         predictions["timing"] = benchmark_metrics
 

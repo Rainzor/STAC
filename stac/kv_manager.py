@@ -1,10 +1,13 @@
 # Copyright (c) 2025 STAC Authors. All rights reserved.
 
 import gc
+import logging
 import torch
 import torch.nn.functional as F
 import warnings
 from typing import List, Optional, Tuple, Union
+
+logger = logging.getLogger(__name__)
 
 from .flash_attn_triton import fa_forward_colsum_fast
 
@@ -107,8 +110,6 @@ class KVManager:
         self.device = device if device is not None else torch.device("cpu")
         self.debug = debug
 
-        print(f"[Register WindowKV] (layer number {self._L_eff}/{self.num_layers}): buf_size_gpu={self.reserved_buffer_size}, buf_size_cpu:{self.reserved_buffer_size_cpu}, token_per_frame={self.token_per_f},recent_size={self.recent_size}, pinned_idx={pinned_idx.tolist()}")
-
         self.key_cache_hot: Optional[torch.Tensor] = None
         self.value_cache_hot: Optional[torch.Tensor] = None
         self._token_indices_hot: Optional[torch.Tensor] = None
@@ -119,6 +120,23 @@ class KVManager:
         self._token_indices_hot_cpu: Optional[torch.Tensor] = None
         self._offset_hot_cpu = None
         self.use_cpu = False
+
+        if type(self) is KVManager:
+            self._log_registration()
+
+    def _log_registration(self) -> None:
+        """Override in subclasses to log registration. Called from __init__ only when type(self) is the concrete class."""
+        pinned = []
+        if self._pinned_token_index.numel() > 0:
+            pinned = sorted(set((self._pinned_token_index // self.token_per_f).tolist()))
+        logger.info(
+            "[WindowKV] layers=%d/%d  tok/frame=%d  window=%dx%d  pinned=%s  kv_gpu_cap=%dx%d  kv_cpu_cap=%dx%d",
+            self._L_eff, self.num_layers, self.token_per_f,
+            self.recent_size, self.token_per_f,
+            pinned,
+            self.reserved_buffer_size, self.token_per_f,
+            self.reserved_buffer_size_cpu, self.token_per_f,
+        )
 
     #----- Utility functions -----#
 

@@ -24,25 +24,21 @@ Checkpoints go under `ckpt/{stream3r,streamvggt}/` as `model.safetensors` or `mo
 ## Common Commands
 
 ```bash
-# Single-scene / few scenes: use eval launch with dataset_type + optional scene_name
+# Single-scene / few scenes (--mode stac = window_chunk_merge + streaming + default STAC params)
 python eval/long_recon/launch.py --output_dir eval_recon --dataset_type NRGBD --scene_name complete_kitchen \
-    --model_name causalvggt --base_model stream3r --mode window_chunk_merge --streaming \
-    -win 4 -ck 4 -hh 2 -ret_sz 2 -ret_buf --save_tag stac
+    --model_name causalvggt --base_model stream3r --mode stac --save_tag stac
 
 # Evaluation - 3D reconstruction
 python eval/long_recon/launch.py --output_dir eval_recon --dataset_type NRGBD \
-    --model_name causalvggt --base_model stream3r --mode window_chunk_merge --streaming \
-    -win 4 -ck 4 -hh 2 -ret_sz 2 -ret_buf --save_tag stac
+    --model_name causalvggt --base_model stream3r --mode stac --save_tag stac
 
 # Evaluation - camera pose
 python eval/cam_pose/launch.py --output_dir eval_cam_results --dataset_type tum \
-    --model_name causalvggt --base_model stream3r --mode window_chunk_merge --streaming \
-    -win 4 -ck 4 -hh 2 -ret_sz 2 -ret_buf --tag stac
+    --model_name causalvggt --base_model stream3r --mode stac --tag stac
 
 # Evaluation - video depth (two-step: predict then evaluate)
 python eval/video_depth/launch.py --output_dir eval_depth --eval_dataset bonn \
-    --model_name causalvggt --base_model stream3r --mode window_chunk_merge --streaming \
-    -win 4 -ck 4 -hh 2 -ret_sz 2
+    --model_name causalvggt --base_model stream3r --mode stac
 python eval/video_depth/eval_depth.py --output_dir eval_depth --eval_dataset bonn --align scale
 
 # Batch eval scripts
@@ -96,7 +92,8 @@ Per-step lifecycle in streaming: `append_kv` (layer-wise) → `decode_sparse_att
 
 | Mode | Key |
 |:---|:---|
-| `window_chunk_merge` | **Recommended** — chunked sliding window + voxel-based spatial KV merging |
+| `stac` | **Recommended** preset — expands to `window_chunk_merge` + streaming + default params (win=4, ck=4, hh=2, ret_sz=2, ret_buf) |
+| `window_chunk_merge` | Chunked sliding window + voxel-based spatial KV merging (manual param tuning) |
 | `window_merge` | Window + voxel merging (no chunking) |
 | `window` / `window_kv` | Sliding window only |
 | `window_chunk` | Chunked window without merging |

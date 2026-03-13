@@ -35,7 +35,7 @@ def parse_args():
     parser.add_argument("--base_model", type=str, default="stream3r",
                         choices=["stream3r", "streamvggt"],
                         help="Backbone weights to use")
-    parser.add_argument("--size", type=int, default=512, choices=[224, 512, 518],
+    parser.add_argument("--size", type=int, default=518, choices=[224, 512, 518],
                         help="Input resolution")
     parser.add_argument("--mode", type=str, default="full",
                         help="Attention mode (full, causal, window_kv, window_chunk_merge, ...)")
@@ -49,7 +49,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_scene_images(scene_dir, size=512):
+def load_scene_images(scene_dir, size=518):
     """Load images from scene_dir/images/ and resize to the target resolution."""
     image_dir = Path(scene_dir) / "images"
     exts = ("*.png", "*.jpg", "*.jpeg")
@@ -67,10 +67,11 @@ def load_scene_images(scene_dir, size=512):
 
     images = load_and_preprocess_images([str(p) for p in image_paths])
 
+    # resolution as (H, W) for F.interpolate; matches eval (W,H): 512->(512,384), 518->(518,336)
     if size == 512:
         resolution = (384, 512)
     elif size == 518:
-        resolution = (336, 518)
+        resolution = (392, 518)
     elif size == 224:
         resolution = (224, 224)
     else:
