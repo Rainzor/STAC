@@ -115,7 +115,7 @@ def run_model(model, images, model_name, mode='full',
             benchmark_metrics[k] = benchmark_metrics[k] / processed_frames
             total_time += benchmark_metrics[k]
             logger.info(f" Average {k} time per frame: {benchmark_metrics[k]:.2f} ms")
-        logger.info(f"Total average time per frame: {total_time:.2f}ms, FPS: {1000/total_time:.1f} ")
+        logger.info(f"Total average time per frame: {total_time:.2f} ms, FPS: {1000/total_time:.1f} ")
         benchmark_metrics["infer_fps"] = 1000.0 / total_time if total_time > 0 else 0
         predictions["timing"] = benchmark_metrics
         predictions["merger"] = session.get_stats()
@@ -131,11 +131,30 @@ def run_model(model, images, model_name, mode='full',
             benchmark_metrics[k] = benchmark_metrics[k] / processed_frames
             total_time += benchmark_metrics[k]
             logger.info(f" Average {k} time per frame: {benchmark_metrics[k]:.2f}ms")
-        logger.info(f"Total average time per frame: {total_time:.2f} ms, FPS: {1000/total_time:.1f} ")
+        logger.info(f"Total average time per frame: {total_time:.2f}  ms, FPS: {1000/total_time:.1f} ")
         benchmark_metrics["infer_fps"] = 1000.0 / total_time if total_time > 0 else 0
         predictions["timing"] = benchmark_metrics
 
     predictions["mode"] = mode
     predictions["streaming"] = streaming
+    # Effective config actually used (e.g. after stac expansion) for accurate metrics
+    predictions["effective_config"] = {
+        "mode": mode,
+        "streaming": streaming,
+        "window_size": kwargs.get("window_size"),
+        "chunk_size": kwargs.get("chunk_size"),
+        "hh_size": kwargs.get("hh_size"),
+        "retrieval_size": kwargs.get("retrieval_size"),
+        "return_buf": kwargs.get("return_buf"),
+        "temperature": kwargs.get("temperature"),
+        "voxel_size": kwargs.get("voxel_size"),
+        "voxel_num": kwargs.get("voxel_num"),
+        "conf_threshold": kwargs.get("conf_threshold"),
+        "voxel_buf_cap": kwargs.get("voxel_buf_cap"),
+        "voxel_piv_cap": kwargs.get("voxel_piv_cap"),
+        "voxel_backend": kwargs.get("voxel_backend"),
+        "allocator": kwargs.get("allocator"),
+        "pinned_frame_indices": kwargs.get("pinned_frame_indices"),
+    }
 
     return predictions

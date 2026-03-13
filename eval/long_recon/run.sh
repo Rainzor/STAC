@@ -8,9 +8,6 @@ MODEL_NAME="causalvggt"
 BASE_MODEL="stream3r"
 KF_EVERY=5
 
-SAVE_TAG="stac"
-VIS_TAG="stac"
-
 DATASETS=("NRGBD" "7scenes")
 
 for DATASET in "${DATASETS[@]}"; do
@@ -24,7 +21,7 @@ for DATASET in "${DATASETS[@]}"; do
         --model_name "${MODEL_NAME}" \
         --base_model "${BASE_MODEL}" \
         --dataset_type "${DATASET}" \
-        --save_tag "${SAVE_TAG}" \
-        --vis_tag "${VIS_TAG}" \
+        --save_tag "stac" \
+        --vis_tag "cuda" \
         --mode stac
 done

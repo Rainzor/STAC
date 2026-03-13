@@ -25,6 +25,20 @@ from model_wrapper import load_model, run_model
 from eval.long_recon.data import SevenScenes, NRGBD, DTU
 from eval.long_recon.eval_utils import eval_scene
 
+
+def _to_json_serializable(obj):
+    """Recursively convert torch/numpy types to native Python for JSON dump."""
+    if isinstance(obj, dict):
+        return {k: _to_json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_json_serializable(x) for x in obj]
+    if hasattr(obj, "item"):  # torch.Tensor / np.ndarray scalar
+        return obj.item()
+    if hasattr(obj, "tolist"):  # torch.Tensor / np.ndarray
+        return obj.tolist()
+    return obj
+
+
 torch.backends.cuda.matmul.allow_tf32 = True
 
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -157,6 +171,7 @@ def run(images, model, dtype, device, args):
             args.streaming = predictions.get("streaming", args.streaming)
             predictions.pop("mode", None)
             predictions.pop("streaming", None)
+    effective_config = predictions.pop("effective_config", None)
 
     logger.info(f"Model: {args.model_name}, Mode: {args.mode}, Streaming: {args.streaming}")
 
@@ -182,7 +197,9 @@ def run(images, model, dtype, device, args):
         "mode": args.mode,
         "streaming": args.streaming,
     }
-    if "window" in args.mode:
+    if effective_config is not None:
+        model_stats.update(effective_config)
+    elif "window" in args.mode:
         model_stats["window_size"] = args.window_size
         if args.streaming:
             model_stats["hh_size"] = args.hh_size
@@ -200,11 +217,16 @@ def run(images, model, dtype, device, args):
                 model_stats["voxel_piv_cap"] = args.voxel_piv_cap
                 model_stats["voxel_backend"] = args.voxel_backend
 
+    out = {"model": model_stats}
+    if "timing" in predictions:
+        out["Time(ms)"] = predictions["timing"]
+    if "merger" in predictions and predictions["merger"]:
+        out["VoxelCache"] = _to_json_serializable(predictions["merger"])
     torch.cuda.empty_cache()
-    return predictions, {"model": model_stats}
+    return predictions, out
 
 def main(args):
-    if args.size == 518:
+    if args.size == 518: # 640x480 -> 518x392, patch size=14
         resolution = (518, 392)
     elif args.size == 512:
         resolution = (512, 384)
@@ -310,7 +332,7 @@ def main(args):
                 metrics_file = metrics_file.replace(".json", f"_{rand_hash}.json")
             with open(metrics_file, "w") as f:
                 json.dump(basic_metrics, f, indent=2)
-            logger.info(f"📌 Saved metrics to {metrics_file}")
+            logger.info(f"📌 Saved metrics to \"{metrics_file}\"")
 
             all_metrics[scene_name] = basic_metrics
 

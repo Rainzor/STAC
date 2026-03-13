@@ -376,8 +376,6 @@ def main(args):
             if skip_condition is not None and skip_condition(
                         save_dir, seq):
                     continue
-            mask_path_seq_func = metadata.get("mask_path_seq_func",
-                                                lambda mask_path, seq: None)
             filelist = [
                     os.path.join(dir_path, name)
                     for name in os.listdir(dir_path)
@@ -486,7 +484,7 @@ def main(args):
                     
                 with open(metrics_file, "w") as f:
                     json.dump(basic_metrics, f, indent=2)
-                logger.info(f"📌 Saved metrics to {metrics_file}")
+                logger.info(f"📌 Saved metrics to \"{metrics_file}\"")
 
             else:
                 raise NotImplementedError(f"Model {args.model_name} not implemented")

@@ -848,13 +848,13 @@ class STACVoxelKV(HeavyHittersKV):
             - pinned_memory: memory for pinned tokens (always kept)
             - window_memory: memory for recent/window tokens
             - heavy_hitters_memory: memory for heavy-hitter tokens
-            - retrieval_memory: memory for retrieved pivots from voxel store
+            - spatial_cache_usage: memory for retrieved pivots from voxel store
             - voxel_buffer_usage: actual memory used by voxel buffer
             - voxel_buffer_alloc: allocated memory for voxel buffer
             - voxel_pivot_usage: actual memory used by voxel pivots
             - voxel_pivot_alloc: allocated memory for voxel pivots
-            - hot_cache_usage: total actual KV hot cache usage
-            - hot_cache_alloc: total allocated KV hot cache
+            - temporal_cache_usage: total actual KV hot cache usage
+            - temporal_cache_alloc: total allocated KV hot cache
             - total_usage: total actual memory usage
             - total_alloc: total allocated memory
         """
@@ -867,9 +867,9 @@ class STACVoxelKV(HeavyHittersKV):
         pinned_memory = 0.0
         window_memory = 0.0
         heavy_hitters_memory = 0.0
-        retrieval_memory = 0.0
-        hot_cache_usage = 0.0
-        hot_cache_alloc = 0.0
+        spatial_cache_usage = 0.0
+        temporal_cache_usage = 0.0
+        temporal_cache_alloc = 0.0
         
         # Calculate per-layer memory
         for l in range(self._L_eff):
@@ -893,14 +893,14 @@ class STACVoxelKV(HeavyHittersKV):
             # Retrieval cache (retrieved pivots from voxel store)
             T_ret = self._offset_retrieval[l]
             ret_bytes = H * T_ret * kv_bytes_per_token
-            retrieval_memory += ret_bytes / (1024.0 ** 2)
+            spatial_cache_usage += ret_bytes / (1024.0 ** 2)
             
             # Hot cache (actual usage and allocation)
             hot_usage_bytes = H * T_live * kv_bytes_per_token
-            hot_cache_usage += hot_usage_bytes / (1024.0 ** 2)
+            temporal_cache_usage += hot_usage_bytes / (1024.0 ** 2)
             
             hot_alloc_bytes = H * self.reserved_buffer_token_size * kv_bytes_per_token
-            hot_cache_alloc += hot_alloc_bytes / (1024.0 ** 2)
+            temporal_cache_alloc += hot_alloc_bytes / (1024.0 ** 2)
         
         # Voxel store memory (from merger)
         voxel_buffer_usage = 0.0
@@ -915,9 +915,9 @@ class STACVoxelKV(HeavyHittersKV):
             voxel_pivot_usage = vstore_mem.get("pivot_used_mem", 0.0)
             voxel_pivot_alloc = vstore_mem.get("pivot_alloc_mem", 0.0)
         # Total calculations
-        total_usage = (hot_cache_usage + retrieval_memory + 
+        total_usage = (temporal_cache_usage + spatial_cache_usage + 
                        voxel_buffer_usage + voxel_pivot_usage)
-        total_alloc = (hot_cache_alloc + retrieval_memory + 
+        total_alloc = (temporal_cache_alloc + spatial_cache_usage + 
                        voxel_buffer_alloc + voxel_pivot_alloc)
         
         return {
@@ -925,15 +925,16 @@ class STACVoxelKV(HeavyHittersKV):
             "pinned_memory": pinned_memory,
             "window_memory": window_memory,
             "heavy_hitters_memory": heavy_hitters_memory,
-            "retrieval_memory": retrieval_memory,
+            "spatial_cache_usage": spatial_cache_usage,
+            "spatial_cache_alloc": voxel_pivot_usage+voxel_buffer_usage,
             # Voxel store details
             "voxel_buffer_usage": voxel_buffer_usage,
             "voxel_buffer_alloc": voxel_buffer_alloc,
             "voxel_pivot_usage": voxel_pivot_usage,
             "voxel_pivot_alloc": voxel_pivot_alloc,
             # Hot cache totals
-            "hot_cache_usage": hot_cache_usage,
-            "hot_cache_alloc": hot_cache_alloc,
+            "temporal_cache_usage": temporal_cache_usage,
+            "temporal_cache_alloc": temporal_cache_alloc,
             # Grand totals
             "total_usage": total_usage,
             "total_alloc": total_alloc,

@@ -201,6 +201,16 @@ class VoxelKVMerger:
         """No-op for compatibility with KV manager lifecycle (state is recreated on ensure_capacity)."""
         pass
 
+    def _flush_cuda_diagnostics(self) -> None:
+        """Fetch [SEG-EXPAND]/[SEG-WARN] from CUDA merger and log so they appear above Rich Live."""
+        if self._stac_merger is None:
+            return
+        take = getattr(self._stac_merger, "take_diagnostics", None)
+        if take is None:
+            return
+        for msg in take():
+            logger.info("%s", msg)
+
     def update_voxel_zones(self, voxel_zones: torch.Tensor):
         self._pending_voxel_zones = voxel_zones
 
@@ -980,6 +990,7 @@ class VoxelKVMerger:
             replace_thresh=self.replace_threshold,
             score_thresh=self.score_threshold,
         )
+        self._flush_cuda_diagnostics()
 
         E_overflow_new = rows_over.shape[0]
         if _MEM_PROFILE:
@@ -1089,6 +1100,7 @@ class VoxelKVMerger:
             replace_thresh=self.replace_threshold,
             score_thresh=self.score_threshold,
         )
+        self._flush_cuda_diagnostics()
 
         del keys_cuda, values_cuda, scores_cuda, rows_cuda
 

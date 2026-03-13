@@ -1128,6 +1128,7 @@ __global__ void all2one_merge_fused_kernel(
             piv_Ss[pps + ws] = ss;
             piv_M[pps + ws] = 1;
             piv_rs[row] = (int8_t)BufState::AVAILABLE;
+            piv_row_count[row] = 1;  // one pivot written by all2one merge
         }
     }
 
@@ -3023,6 +3024,10 @@ __global__ void remerge_fused_seg_kernel(
             seg_piv_Ss[new_sid] = ss;
             piv_row_seg[piv_seg_base + ws] = new_sid;
             piv_rs[row] = (int8_t)BufState::AVAILABLE;
+            int32_t n_valid = 0;
+            for (int p = 0; p < P && p < MAX_PIVOTS; ++p)
+                if (piv_row_seg[piv_seg_base + p] >= 0) n_valid++;
+            piv_rc[row] = n_valid;
             if (diag) atomicAdd(&diag[DIAG_A2O_PIV_CREATED], 1);
         }
     }

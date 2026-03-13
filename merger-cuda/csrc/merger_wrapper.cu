@@ -6,6 +6,8 @@
 #include "merger_wrapper.h"
 #include "include/merger_kernels.cuh"
 #include <algorithm>
+#include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 
 namespace causalvggt {
@@ -1287,6 +1289,23 @@ std::map<std::string, int64_t> MergerWrapper::pool_stats() const {
     }
 
     return result;
+}
+
+void MergerWrapper::push_diagnostic(const char* fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n >= 0 && n < (int)sizeof(buf)) {
+        diagnostic_messages_.emplace_back(buf);
+    }
+}
+
+std::vector<std::string> MergerWrapper::take_diagnostics() {
+    std::vector<std::string> out;
+    out.swap(diagnostic_messages_);
+    return out;
 }
 
 void MergerWrapper::insert_and_merge(
@@ -2794,8 +2813,8 @@ void MergerWrapper::ensure_seg_pool_slots(cudaStream_t stream) {
     int64_t buf_threshold = std::max(seg_buf_growth_, int64_t(2048));
     if (buf_top_h < buf_threshold) {
         int64_t new_cap = seg_buf_cap_ + seg_buf_growth_;
-        fprintf(stderr, "  [SEG-EXPAND] buf_pool: %ld->%ld (free=%d, threshold=%ld)\n",
-                seg_buf_cap_, new_cap, buf_top_h, buf_threshold);
+        push_diagnostic("  [SEG-EXPAND] buf_pool: %ld->%ld (free=%d, threshold=%ld)",
+                        seg_buf_cap_, new_cap, buf_top_h, buf_threshold);
         print_cuda_mem("seg_expand_buf:before");
         expand_seg_buf_pool(seg_buf_cap_, new_cap);
         update_seg_views();
@@ -2807,17 +2826,15 @@ void MergerWrapper::ensure_seg_pool_slots(cudaStream_t stream) {
         int32_t piv_total_free = piv_zone_top_.sum().item<int32_t>();
         int64_t piv_threshold = std::max(int64_t(2048), seg_piv_cap_ / 8);
         if (piv_total_free < piv_threshold) {
-            fprintf(stderr, "  [SEG-WARN] piv_zone_pool critically low: %d free of %ld "
-                    "(threshold=%ld). Increase init piv_pool_cap or reduce voxel count.\n",
-                    piv_total_free, seg_piv_cap_, piv_threshold);
-            fflush(stderr);
+            push_diagnostic("  [SEG-WARN] piv_zone_pool critically low: %d free of %ld (threshold=%ld). Increase init piv_pool_cap or reduce voxel count.",
+                            piv_total_free, seg_piv_cap_, piv_threshold);
         }
     } else {
         int64_t piv_threshold = std::max(seg_piv_growth_, int64_t(2048));
         if (piv_top_h < piv_threshold) {
             int64_t new_cap = seg_piv_cap_ + seg_piv_growth_;
-            fprintf(stderr, "  [SEG-EXPAND] piv_pool: %ld->%ld (free=%d, threshold=%ld)\n",
-                    seg_piv_cap_, new_cap, piv_top_h, piv_threshold);
+            push_diagnostic("  [SEG-EXPAND] piv_pool: %ld->%ld (free=%d, threshold=%ld)",
+                            seg_piv_cap_, new_cap, piv_top_h, piv_threshold);
             print_cuda_mem("seg_expand_piv:before");
             expand_seg_piv_pool(seg_piv_cap_, new_cap);
             update_seg_views();

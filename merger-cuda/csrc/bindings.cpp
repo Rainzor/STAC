@@ -186,6 +186,11 @@ PYBIND11_MODULE(_ext, m) {
                  piv_alloc_count: total pivot token capacity
                  piv_used_slots: physical pool slots in use
              )doc")
+        .def("take_diagnostics", &causalvggt::MergerWrapper::take_diagnostics,
+             R"doc(
+             Return and clear diagnostic messages (e.g. [SEG-EXPAND], [SEG-WARN]).
+             Call after insert_and_merge_with_rows_seg or ensure_capacity and log in Python.
+             )doc")
         .def_property_readonly("buffer_pool_K", &causalvggt::MergerWrapper::buffer_pool_K)
         .def_property_readonly("buffer_pool_V", &causalvggt::MergerWrapper::buffer_pool_V)
         .def_property_readonly("buffer_pool_S", &causalvggt::MergerWrapper::buffer_pool_S)

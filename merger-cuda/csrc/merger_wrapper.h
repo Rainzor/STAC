@@ -21,6 +21,7 @@
 
 #include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "include/merger_types.h"
@@ -165,6 +166,9 @@ public:
     
     std::map<std::string, int64_t> pool_stats() const;
 
+    /** Return and clear diagnostic messages (e.g. [SEG-EXPAND], [SEG-WARN]) for Python to log. */
+    std::vector<std::string> take_diagnostics();
+
     const backend::MergerConfig& config() const { return config_; }
     const backend::MergerViews& views() const { return views_; }
 
@@ -296,6 +300,10 @@ private:
     void expand_seg_piv_pool(int64_t old_cap, int64_t new_cap);
     void expand_seg_row_metadata(int64_t old_S_tot, int64_t new_S_tot);
     void ensure_seg_pool_slots(cudaStream_t stream);
+
+    void push_diagnostic(const char* fmt, ...);
+
+    std::vector<std::string> diagnostic_messages_;
 
 public:
     // Segmented pool public API

@@ -76,12 +76,12 @@ Feed-forward 3D models ([STream3R](https://github.com/NIRVANALAN/STream3R), [Str
 ### Attention modes
 
 
-| Mode                   | Streaming | Description                                         |
-| ---------------------- | --------- | --------------------------------------------------- |
+| Mode                   | Streaming | Description                                                           |
+| ---------------------- | --------- | --------------------------------------------------------------------- |
 | `stac`                 | Yes       | **Recommended** preset (= `window_chunk_merge` + default STAC params) |
-| `full`                 | No        | Full attention (memory ∝ N²)                        |
-| `causal` / `window_kv` | Yes       | Sliding window KV cache                             |
-| `window_chunk_merge`   | Yes       | Chunked window + voxel merge (manual param tuning)  |
+| `full`                 | No        | Full attention (memory ∝ N²)                                          |
+| `causal` / `window_kv` | Yes       | Sliding window KV cache                                               |
+| `window_chunk_merge`   | Yes       | Chunked window + voxel merge (manual param tuning)                    |
 
 
 ## Installation
@@ -97,11 +97,13 @@ Install [PyTorch](https://pytorch.org/get-started/locally/) for your CUDA (e.g. 
 
 ```bash
 # Example: CUDA 12.8
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
+--index-url https://download.pytorch.org/whl/cu128 
+
 pip install -r requirements.txt
 ```
 
-**Optional — CUDA KV merger** (faster `--voxel_backend cuda`): set `CUDA_HOME` to your CUDA root, then:
+**Install CUDA KV merger** (faster `--voxel_backend cuda`): set `CUDA_HOME` to your CUDA root, then:
 
 ```bash
 pip install -e merger-cuda --no-build-isolation

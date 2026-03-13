@@ -1,7 +1,4 @@
-from typing import List, Optional, Sequence, Tuple, Union
-
 import torch
-import numpy as np
 from causalvggt.models.vggt import CausalVGGT
 from stac.kv_manager import KVManager
 from stac.stac_voxel import STACVoxelKV
@@ -10,9 +7,7 @@ from causalvggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 import os
 import logging
-import json
 from copy import deepcopy
-import time
 
 from rich.live import Live
 from rich.table import Table
@@ -435,8 +430,8 @@ class StreamSession:
 
                     timing["kv_retrieval_time"] = retrieval_time
 
-                    prune_merge_time = self.model.aggregator.prune_kv_mgr(timing=debug_timing)
-                    timing["kv_prune_merge_time"] = prune_merge_time
+                    evict_merge_time = self.model.aggregator.prune_kv_mgr(timing=debug_timing)
+                    timing["kv_evict_merge_time"] = evict_merge_time
 
                     if frame_idx % (chunk_size * 4) == 0 or frame_idx >= num_frames - chunk_size:
                         _mem_profile = os.environ.get("MERGER_MEM_PROFILE", "0") == "1"
@@ -475,24 +470,24 @@ class StreamSession:
 
                     agg_t = timing.get("aggregator_infer_time", 0) / frame_buffer_size
                     pos_t = kv_pos_time / frame_buffer_size
-                    mrg_t = prune_merge_time / frame_buffer_size
+                    mrg_t = evict_merge_time / frame_buffer_size
                     ret_t = retrieval_time / frame_buffer_size
 
                     mem_details = kv_manager.get_memory_details()
-                    hot_mem   = mem_details.get("hot_cache_usage", 0)
+                    temporal_mem   = mem_details.get("temporal_cache_usage", 0)
                     vox_used  = (mem_details.get("voxel_buffer_usage", 0)
                                  + mem_details.get("voxel_pivot_usage", 0))
                     vox_alloc = (mem_details.get("voxel_buffer_alloc", 0)
                                  + mem_details.get("voxel_pivot_alloc", 0))
-                    ret_mem   = mem_details.get("retrieval_memory", 0)
+                    spatial_mem   = mem_details.get("spatial_cache_usage", 0)
 
                     progress.update(task, advance=frame_buffer_size)
                     live.update(Group(
                         progress,
                         _stats_table([
-                            ("Time(ms)", f"agg={agg_t:.1f}  pos={pos_t:.1f}  merge={mrg_t:.1f}  ret={ret_t:.1f}"),
-                            ("Mem(MB)", f"hot={hot_mem:.0f}  vox(used/alloc)={vox_used:.0f}/{vox_alloc:.0f}  ret={ret_mem:.0f}"),
-                            ("GPU(MB)", f"allocated={allocated:.0f}  reserved={reserved:.0f}"),
+                            ("Time(ms)", f"agg={agg_t:.1f} | ret={ret_t:.1f} | pos={pos_t:.1f} | evict&merge={mrg_t:.1f}"),
+                            ("Cache(MB)", f"temporal={temporal_mem:.0f} | spatial(retrieval)={spatial_mem:.0f} |  voxel(used/alloc)={vox_used:.0f}/{vox_alloc:.0f}  "),
+                            ("GPU(MB)", f"allocated={allocated:.0f} | reserved={reserved:.0f}"),
                         ]),
                     ))
                     self._processed_frames += frame_buffer_size
@@ -506,7 +501,9 @@ class StreamSession:
                 voxel_merge_stats[0] = merge_info
                 metrics = {}
                 metrics["hyperparameters"] = merger_kwargs
-                metrics["stats"] = voxel_merge_stats
+                metrics["Token"] = voxel_merge_stats
+                if hasattr(kv_mgr, "get_memory_details"):
+                    metrics["Memory(MB)"] = kv_mgr.get_memory_details()
                 self.stats = metrics
 
     def register_kv_mgr(self, mode,

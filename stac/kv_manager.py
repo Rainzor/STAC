@@ -349,17 +349,15 @@ class KVManager:
         q = query_states.transpose(1, 2)  # [B, H, Tq, D]
         k = k.unsqueeze(0)                # [B, H, Tkv, D]
         v = v.unsqueeze(0)                # [B, H, Tkv, D]
-        out = F.scaled_dot_product_attention(q, k, v).transpose(1,2) # [B, Tq, H, D]
-        
-        # k = k.unsqueeze(0).transpose(1, 2).contiguous()  # [B, T, H, D]
-        # v = v.unsqueeze(0).transpose(1, 2).contiguous()  # [B, T, H, D]
-        # q = query_states.contiguous()               # [B, Tq, H, D]
-        # out, _, col_sum = fa_forward_colsum_fast(
-        #     q, k, v,
-        #     write_o=True
-        #     )
+        out = F.scaled_dot_product_attention(q, k, v).transpose(1, 2)  # [B, Tq, H, D]
 
-        return out # [B, Tq, H, D]
+        # Release temporary GPU tensors (incl. CPU->GPU copies) so memory can be reclaimed
+        # and not accumulate across layers/steps (reduces OOM risk).
+        del q, k, v, k_gpu, v_gpu
+        if T_cpu > 0:
+            del k_cpu, v_cpu
+
+        return out  # [B, Tq, H, D]
 
     @torch.no_grad()
     def prune_kv(self):
