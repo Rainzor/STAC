@@ -1,3 +1,4 @@
+# Copyright (c) 2025 STAC Authors. All rights reserved.
 # Ref: https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn_interface/src/flash_attn_triton.py
 
 import math

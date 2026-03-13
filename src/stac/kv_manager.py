@@ -1,3 +1,5 @@
+# Copyright (c) 2025 STAC Authors. All rights reserved.
+
 import gc
 import torch
 import torch.nn.functional as F
@@ -44,14 +46,14 @@ class KVManager:
 
 
         if register_layers is None:
-            managed = list(range(self.num_layers))   # 全部受管
+            managed = list(range(self.num_layers))   # manage all layers
         else:
             managed = sorted({l for l in register_layers if 0 <= l < self.num_layers})
         if len(managed) == 0:
             raise ValueError("register_layers is empty after filtering valid indices.")
 
-        # layer -> slot（未受管层为 -1），slot -> layer（受管层的原始 layer 索引）
-        self._managed_layers: List[int] = managed                     # 长度 L_eff
+        # layer -> slot (unmanaged layers -1), slot -> layer (original layer index for managed)
+        self._managed_layers: List[int] = managed                     # length L_eff
         self._L_eff = len(managed)
         
         self._layer2slot = torch.full((self.num_layers,), -1, dtype=torch.long)
@@ -104,11 +106,8 @@ class KVManager:
         self.dtype = dtype
         self.device = device if device is not None else torch.device("cpu")
         self.debug = debug
-        self.ablate = kwargs.get("ablate", [])
 
         print(f"[Register WindowKV] (layer number {self._L_eff}/{self.num_layers}): buf_size_gpu={self.reserved_buffer_size}, buf_size_cpu:{self.reserved_buffer_size_cpu}, token_per_frame={self.token_per_f},recent_size={self.recent_size}, pinned_idx={pinned_idx.tolist()}")
-        if len(self.ablate)>0:
-            print(f"[Ablation] {self.ablate}")
 
         self.key_cache_hot: Optional[torch.Tensor] = None
         self.value_cache_hot: Optional[torch.Tensor] = None
@@ -143,7 +142,7 @@ class KVManager:
     #----- Reset / Free -----#
     def reset(self):
         self._processed_frames = 0
-        # 每层一个 [H, 0] 的 LongTensor, intialize with -1
+        # per-layer [H, 0] LongTensor, initialize with -1
         self.key_cache_hot = torch.empty(self._L_eff, self.num_heads, self.reserved_buffer_token_size, self.head_dim,
                                     dtype=self.dtype, device=self.device)
         self.value_cache_hot = torch.empty_like(self.key_cache_hot)
@@ -158,7 +157,6 @@ class KVManager:
         # 1) Clear metadata
         self._processed_frames = 0
         # 2) Clear caches
-
         self.key_cache_hot      = None
         self.value_cache_hot    = None
         self._token_indices_hot = None
@@ -399,8 +397,8 @@ class KVManager:
 
     def _apply_keep_and_compact(self, slot_idx: int, keep_idx_h: torch.Tensor):
         """
-        keep_idx_h: [H, T'] 每个 head 的保留 token 索引。
-        并行 gather 版，无需 head 循环。
+        keep_idx_h: [H, T'] kept token indices per head.
+        Parallel gather version; no per-head loop.
         """
         H, Tprime = keep_idx_h.shape
         K = self.key_cache_hot[slot_idx]          # [H, T, D]

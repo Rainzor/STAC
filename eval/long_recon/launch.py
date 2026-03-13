@@ -27,8 +27,6 @@ from model_wrapper import load_model, run_model
 from eval.long_recon.data import SevenScenes, NRGBD, DTU
 from eval.long_recon.eval_utils import eval_scene
 
-import json
-
 torch.backends.cuda.matmul.allow_tf32 = True
 
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -82,8 +80,6 @@ def get_args_parser():
                         help="Processing mode")
     parser.add_argument("--streaming", action="store_true",
                         help="Use streaming mode")
-    parser.add_argument("--max_kv_size", type=int, default=-1,
-                        help="Max KV cache frames (-1 for all)")
 
     # KV cache
     parser.add_argument("--window_size", "-win", type=int, default=0)
@@ -92,7 +88,6 @@ def get_args_parser():
     parser.add_argument("--retrieval_size", "-ret_sz", type=int, default=0)
     parser.add_argument("--retrieve_buf", "-ret_buf", action="store_true")
     parser.add_argument("--temperature", type=float, default=0.9)
-    parser.add_argument("--kvcache_patch", type=int, default=1)
     parser.add_argument("--pinned", type=int, default=[0], nargs="+")
 
     # voxel
@@ -102,15 +97,12 @@ def get_args_parser():
                         help="Confidence threshold filter for voxel merging. ")
     parser.add_argument("--voxel_buf_cap", type=int, default=8)
     parser.add_argument("--voxel_piv_cap", type=int, default=4)
-    parser.add_argument("--voxel_backend", type=str, default="python",
+    parser.add_argument("--voxel_backend", type=str, default="cuda",
                         choices=["cuda", "python"])
-    parser.add_argument("--allocator", "-alloc", type=str, default="slab",
+    parser.add_argument("--allocator", "-alloc", type=str, default="segment",
                         choices=["static", "slab", "segment"])
 
-    # misc
-    parser.add_argument("--ablate", nargs="*", default=[])
-
-    #eval
+    # eval
     parser.add_argument("--eval_cpu", action="store_true",
                         help="Evaluate on CPU (default: CUDA)")
     return parser
@@ -138,7 +130,6 @@ def run(images, model, dtype, device, args):
     model_kwargs = {
         "tag": args.vis_tag,
         "cam_cache_update": False,
-        "max_frames": args.max_kv_size if args.max_kv_size > 0 else frame_num + 1,
         "window_size": args.window_size,
         "hh_size": args.hh_size,
         "retrieval_size": args.retrieval_size,
@@ -152,9 +143,7 @@ def run(images, model, dtype, device, args):
         "voxel_backend": args.voxel_backend,
         "chunk_size": args.chunk_size,
         "allocator": args.allocator,
-        "kvcache_patch_size": args.kvcache_patch,
         "pinned_frame_indices": args.pinned,
-        "ablate": args.ablate,
     }
 
     with torch.no_grad():
@@ -194,14 +183,12 @@ def run(images, model, dtype, device, args):
         "base_model": args.base_model,
         "mode": args.mode,
         "streaming": args.streaming,
-        "ablate": args.ablate,
     }
     if "window" in args.mode:
         model_stats["window_size"] = args.window_size
         if args.streaming:
             model_stats["hh_size"] = args.hh_size
             model_stats["retrieval_size"] = args.retrieval_size
-            model_stats["kvcache_patch_size"] = args.kvcache_patch
             model_stats["chunk_size"] = args.chunk_size
             model_stats["pinned_frame_indices"] = args.pinned
             model_stats["temperature"] = args.temperature

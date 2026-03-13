@@ -1,3 +1,5 @@
+# Copyright (c) 2025 STAC Authors. All rights reserved.
+
 from typing import List, Optional, Tuple, Dict, Callable
 import os
 import torch
@@ -11,15 +13,15 @@ from .merger import VoxelKVMerger, _MEM_PROFILE, _gpu_mem_mb, _tensor_mb
 
 class STACVoxelKV(HeavyHittersKV):
     """
-    STACVoxelKV: voxel-based, STAC-style KV 管理器（在 H2O 框架上叠加体素池与合并）。
-    
-    Decode 时序（per step）：
-      1) append_kv(layer-wise): 像 H2O 一样把新 K/V 写入 hot cache（仅 hot，不动 voxel 池）
-      2) decode_sparse_attn(layer-wise): 对 hot (+ merge) 计算注意力、更新 hot scores
-    Step 结束后（一次性作用于所有 layer）：
-      3) append_positions(all layers): 体素化新 token 的 3D 坐标，写入 token→voxel id（与 hot 对齐）
-      4) prune_kv(all layers): 对 hot 做 H2O 的剔除；**在剔除路径**将 drop 的 token 批量写入 VoxelKVStore（buffer），并按阈值触发段并行合并
-      5) retrieve_kv(all layers): 基于“每层的 voxel 重要度”从 VoxelKVStore 取回 pivot（可设 per-voxel 配额、全局上限），写入 merge cache，供下一次注意力使用
+    STACVoxelKV: voxel-based, STAC-style KV manager (H2O framework plus voxel pool and merge).
+
+    Decode sequence (per step):
+      1) append_kv(layer-wise): write new K/V to hot cache (hot only; voxel pool untouched)
+      2) decode_sparse_attn(layer-wise): compute attention over hot (+ merge), update hot scores
+    After each step (once for all layers):
+      3) append_positions(all layers): voxelize new token 3D coords, write token->voxel id (aligned with hot)
+      4) prune_kv(all layers): H2O pruning on hot; on the eviction path, batch-write dropped tokens to VoxelKVStore (buffer) and trigger segment-parallel merge by threshold
+      5) retrieve_kv(all layers): retrieve pivots from VoxelKVStore by per-layer voxel importance (per-voxel quota and global cap configurable), write to merge cache for next attention
     """
 
     def __init__(
@@ -28,31 +30,31 @@ class STACVoxelKV(HeavyHittersKV):
         voxel_size: float = 0.05,
         voxelize_layers: Optional[List[int]] = None,
         # --- VoxelKVStore ---
-        init_voxels: int = 1024,            # 初始体素数量
-        voxel_buf_cap: int = 32,             # 每个 (head, voxel) 的 buffer 容量
-        voxel_piv_cap: int = 4,            # 每个 (head, voxel) 最多保留多少个 pivot
-        voxel_backend: str = "python",      # 后端类型
-        sim_threshold: float = 0.8,           # pivot 相似度阈值
-        replace_threshold: float = 0.8,       # pivot 替换阈值
-        score_threshold: float = 0,          # 或累计分数阈值
-        weight_fn: Optional[Callable]=None,    # pivot 权重函数
+        init_voxels: int = 1024,            # initial voxel count
+        voxel_buf_cap: int = 32,            # buffer capacity per (head, voxel)
+        voxel_piv_cap: int = 4,             # max pivots per (head, voxel)
+        voxel_backend: str = "python",      # backend type
+        sim_threshold: float = 0.8,        # pivot similarity threshold
+        replace_threshold: float = 0.8,     # pivot replacement threshold
+        score_threshold: float = 0,         # or cumulative score threshold
+        weight_fn: Optional[Callable]=None, # pivot weight function
         # --- Slab Pool ---
-        allocator: str = "slab",   # "static" | "slab" | "segment" | "compact"
+        allocator: str = "slab",            # "static" | "slab" | "segment" | "compact"
         slab_growth = 256,
         slab_free_policy = "immediate",
         slab_cap = 1024,
         seg_size: int = 4,
         alloc_debug: bool = False,
         # --- Retrieve ---
-        retrieval_size: int = -1,            # 每层检索多少个 pivot（-1 表示不限制）
+        retrieval_size: int = -1,           # pivots to retrieve per layer (-1 = no limit)
         # --- CPU Offload ---
-        enable_alloc_cpu: bool = False,    # 是否启用CPU offload
-        gpu_threshold_gb: float = 10.0,      # GPU显存阈值(GB) - lowered 
+        enable_alloc_cpu: bool = False,     # enable CPU offload
+        gpu_threshold_gb: float = 10.0,    # GPU memory threshold (GB)
         **kwargs
     ):
         super().__init__(*args, **kwargs)
 
-        # ---- 配置缓存 ----
+        # ---- config cache ----
         self._voxel_size = torch.tensor(voxel_size, dtype=torch.float32, device=self.device)
         self._vm = BinaryVoxel(voxel_size=voxel_size, device=self.device)
         self._voxel_ids = set()
@@ -65,11 +67,7 @@ class STACVoxelKV(HeavyHittersKV):
             self._voxelize_list = [l in voxelize_set for l in range(self.num_layers)]
         assert any(self._voxelize_list), "STACVoxelKV requires at least one voxelized layer."
 
-        if "unif_merge" in self.ablate:
-            weight_fn = lambda scores, sim: torch.ones_like(scores)
-            print("[STACVoxelKV] Ablation: using uniform weight for pivot update.")
- 
-        # 保存 VoxelKVStore 超参，reset 时会复用
+        # VoxelKVStore hyperparams; reused on reset
         self._vk_conf = dict(
             num_heads=self.num_heads,
             head_dim=self.head_dim,
@@ -90,7 +88,6 @@ class STACVoxelKV(HeavyHittersKV):
             slab_cap=slab_cap,
             seg_size=seg_size,
             alloc_debug=alloc_debug,
-            ablate=kwargs.get("ablate", []),
             # CPU Offload parameters
             enable_cpu_offload=enable_alloc_cpu,
             gpu_threshold_gb=gpu_threshold_gb,
@@ -99,13 +96,13 @@ class STACVoxelKV(HeavyHittersKV):
         # Store CPU offload config for reference
         self._enable_alloc_cpu = enable_alloc_cpu
 
-        # Retrieve 默认策略
+        # Retrieve default policy
         self.recent_size = retrieval_size
         self.retrieval_token_size = int(retrieval_size*self.token_per_f)
 
-        # token→voxel id（与 hot 的 _token_indices_hot 对齐）
+        # token->voxel id (aligned with hot _token_indices_hot)
 
-        # --- VoxelKVStore（per layer） ---
+        # --- VoxelKVStore (per layer) ---
         # reset() will initialize
         self._vstores = None
 
@@ -139,7 +136,7 @@ class STACVoxelKV(HeavyHittersKV):
         # ]
         self._vk_conf["num_heads"] = self._L_eff * self.num_heads
         self._vstore = VoxelKVMerger(**self._vk_conf)
-        # token→voxel 映射预分配
+        # token->voxel mapping prealloc
         self._token_voxel_indices = torch.full((self._L_eff, self.num_heads, self.reserved_buffer_token_size), -1, dtype=torch.int32, device=self.device)
         self._offset_voxel = [0 for _ in range(self._L_eff)]
         # --- Merge KV（per layer） ---
@@ -155,22 +152,9 @@ class STACVoxelKV(HeavyHittersKV):
         self._offset_retrieval = [0 for _ in range(self._L_eff)]
 
 
-        # self.key_cache_retrieval = torch.empty(self._L_eff, self.num_heads, 0, self.head_dim, device=self.device, dtype=self.dtype)
-        # self.value_cache_retrieval = torch.empty(self._L_eff, self.num_heads, 0, self.head_dim, device=self.device, dtype=self.dtype)
-        # self._offset_retrieval = [0] * self._L_eff
-        # self._token_indices_retrieval = torch.full((self._L_eff, self.num_heads, 0), -1, dtype=torch.int32, device=self.device)
-        # self._scores_retrieval = torch.empty(self._L_eff, self.num_heads, 0, dtype=torch.float32, device=self.device)
-        # self._bias_retrieval = torch.empty(self._L_eff, self.num_heads, 0, dtype=torch.float32, device=self.device)
-
         torch.cuda.empty_cache()
     
     def free(self):
-        # self.key_cache_retrieval = None
-        # self.value_cache_retrieval = None
-        # self._offset_retrieval = [0] * self._L_eff
-        # self._token_indices_retrieval = None
-        # self._scores_retrieval = None
-        # self._bias_retrieval = None
 
         self._token_voxel_indices = None
         self._offset_voxel = [0] * self._L_eff
@@ -187,21 +171,21 @@ class STACVoxelKV(HeavyHittersKV):
         
 
     # --------------------------------------------
-    #* append kv —— 沿用 HeavyHittersKV 的逻辑
+    # append_kv: same logic as HeavyHittersKV
     # --------------------------------------------
     @torch.no_grad()
     def append_kv(self, key_states, value_states, layer_idx: int):
         super().append_kv(key_states, value_states, layer_idx)
 
     # --------------------------------------------
-    #* decode_sparse_attn (layer-wise)
-    # hot (+retrieve) 一起算注意力，但只更新 hot 的分数（merge 的分数单独缓存）
+    # decode_sparse_attn (layer-wise)
+    # attention over hot + retrieve; only hot scores updated (merge scores cached separately)
     # --------------------------------------------
     @torch.no_grad()
     def decode_sparse_attn(self, query_states: torch.Tensor, layer_idx: int) -> torch.Tensor:
         """
         query_states: [B, Tq, H, D]; B==1
-        返回: attn_output [B, Tq, H, D]
+        Returns: attn_output [B, Tq, H, D]
         """
         B, Tq, H, D = query_states.shape
         query_frame_size = Tq // self.token_per_f
@@ -242,7 +226,7 @@ class STACVoxelKV(HeavyHittersKV):
         # out, _, col_sum = fa_forward_scoresum(q, K_all, V_all, bias=bias, write_o=True)
         scores_total = col_sum.unsqueeze(2)  # [B, H, 1, T_total]
 
-        # 更新 hot 分数（merge 分数额外缓存，便于诊断）
+        # update hot scores (merge scores cached separately for diagnostics)
         self._last_query_offset[slot_idx] = Tq
         if T_ret > 0:
             self._update_scores(scores_total[..., :T_main], slot_idx)
@@ -260,7 +244,7 @@ class STACVoxelKV(HeavyHittersKV):
                               dtype, device,
                               query_frame_size=1):
         """
-        返回 [1,H,1,T_total] 的列偏置，merge 段里 I_ret==-1 的列被置为 -inf。
+        Returns column bias [1,H,1,T_total]; columns with I_ret==-1 in merge segment are set to -inf.
         """
         if T_ret <= 0:
             return None
@@ -273,7 +257,7 @@ class STACVoxelKV(HeavyHittersKV):
     def _update_scores(self, scores: Optional[torch.Tensor]=None, slot_idx: int=0):
         """
         Efficient GPU-optimized version (no view/copy syncs)
-        scores: [B, H, 1, T_live] —— already summed over query dim
+        scores: [B, H, 1, T_live] — already summed over query dim
         """
         super()._update_scores(scores, slot_idx)
 
@@ -282,8 +266,8 @@ class STACVoxelKV(HeavyHittersKV):
     #! -------------------------------
     def _search_recent_neighbors(self, slot_idx=0, dist_thres=0.1) -> Dict[int, torch.Tensor]:
         """
-        在最近写入的 token 所在的 voxel 周围，搜索邻近 voxel。
-        返回字典： slot_idx -> neighbor_voxel_ids [N]
+        Search for neighbor voxels around voxels that contain the most recently written tokens.
+        Returns dict: slot_idx -> neighbor_voxel_ids [N]
         """
         if not self._voxelize_list[slot_idx]:
             self._recent_voxel_ids = torch.tensor(list(self._voxel_ids), dtype=torch.long, device=self.device)
@@ -315,10 +299,10 @@ class STACVoxelKV(HeavyHittersKV):
     @torch.no_grad()
     def append_positions(self, new_positions: torch.Tensor, new_pos_mask: torch.Tensor):
         """
-        体素化新 token 的 3D 坐标，并把 voxel_id 写入每层的 token→voxel 数组（与 hot 对齐）。
+        Voxelize new token 3D coordinates and write voxel_id into per-layer token->voxel arrays (aligned with hot).
         new_positions: [T_new,3] (float32, world units)
         new_pos_mask: [T_new] (bool)
-        注意：必须在所有 layer 的 append_kv 之后、prune_kv 之前调用。
+        Must be called after append_kv for all layers and before prune_kv.
         """
         T_new = new_positions.shape[0]
         device = self.device
@@ -335,7 +319,7 @@ class STACVoxelKV(HeavyHittersKV):
             voxel_id_batch[valid] = voxel_id_valid
             self._voxel_ids.update(voxel_id_valid.cpu().tolist())
 
-        # 将本批 voxel id 写入每层（广播到各 head），大小需与 hot 增量对齐
+        # write this batch of voxel ids to each layer (broadcast to heads); size must match hot increment
         slot_idx = -1
         old_VT = self._offset_voxel[0]
         total_T_expected = old_VT + T_new
@@ -357,7 +341,7 @@ class STACVoxelKV(HeavyHittersKV):
             #     f"[STACVoxelKV:L{l}] size mismatch: hot_T={kv_T} vs voxel_written={total_T_expected}; "
             #     f"ensure append_kv -> append_positions"
             # )
-            # # 广播到 [H,T_new]
+            # # broadcast to [H,T_new]
             # self._token_voxel_indices[l][:, old_T:total_T_expected].copy_(
             #     voxel_id_batch.view(1, -1).expand(self.num_heads, -1)
             # )
@@ -390,16 +374,16 @@ class STACVoxelKV(HeavyHittersKV):
 
     def _apply_keep_and_compact(self, slot_idx: int, keep_idx_h: torch.Tensor):
         """
-        在按 head 的 keep 索引收紧 hot 之前，先将 drop 的 token 批量投入 voxel 池（buffer），
-        然后再调用父类的收紧逻辑；最后把 voxel 索引同步压紧。
+        Before compacting hot by keep indices per head: batch-write dropped tokens into voxel pool (buffer),
+        then call parent compact logic; finally compact voxel indices in sync.
         """
         self._pool_drops_vectorized(slot_idx, keep_idx_h, device=self.device)
 
-        # --- 交给父类做 hot 的压紧 ---
+        # --- delegate hot compaction to parent ---
         super()._apply_keep_and_compact(slot_idx, keep_idx_h)
         if not self._voxelize_list[slot_idx]:
             return
-        # --- voxel 索引同步压紧 ---
+        # --- compact voxel indices in sync ---
         H, Tprime = keep_idx_h.shape
         VX = self._token_voxel_indices[slot_idx]                 # [H,T]
         VX_sel = torch.gather(VX, 1, keep_idx_h).contiguous()     # [H,T']
@@ -419,15 +403,6 @@ class STACVoxelKV(HeavyHittersKV):
             self._token_voxel_indices[:, :, Tprime:].fill_(-1)
         for slot_idx in range(self._L_eff):
             self._offset_voxel[slot_idx] = Tprime
-        # for slot_idx in range(self._L_eff):
-        #     keep_idx_h = keep_idx_lh[slot_idx].clone()
-
-        #     VX = self._token_voxel_indices[slot_idx]  # [H,T]
-        #     VX_sel = torch.gather(VX, 1, keep_idx_h).contiguous()  # [H,T']
-        #     VX[:, :Tprime].copy_(VX_sel)
-        #     if Tprime < VX.size(1):
-        #         VX[:, Tprime:].fill_(-1)
-        #     self._offset_voxel[slot_idx] = Tprime
 
     def _pool_drops_vectorized_parallel(self, keep_idx_lh: torch.Tensor):
         L,H,D= self._L_eff, self.num_heads, self.head_dim
@@ -459,11 +434,8 @@ class STACVoxelKV(HeavyHittersKV):
         assert torch.all(per_layer_head_counts == T_d), f"[STACVoxelKV] per-head drop count mismatch: {per_layer_head_counts.tolist()}"
         if T_d == 0:
             return
-        score_thresh = 0.01
         S_drop = Sh[drop_mask_all].view(L, H, T_d).contiguous().to(torch.float32)
-        low_drop_mask = torch.zeros_like(S_drop, dtype=torch.bool)
-        low_drop_mask = S_drop <= score_thresh  # [L,H,T] bool
-        # 抽取被丢弃片段（保持 [L,H,Td,*]）
+        # extract dropped segments (keep [L,H,Td,*])
         K_drop = Kh[drop_mask_all].view(L, H, T_d, D).contiguous()
         V_drop = Vh[drop_mask_all].view(L, H, T_d, D).contiguous()
         I_drop = Ih[drop_mask_all].view(L, H, T_d).contiguous()
@@ -476,12 +448,9 @@ class STACVoxelKV(HeavyHittersKV):
                        + _tensor_mb(I_drop) + _tensor_mb(VX_drop))
             print(f"  [MEM-PHASE] pool_drops:extract | T_d={T_d}, drop_tensors={drop_mb:.1f}MB, "
                   f"Δalloc={a1-a0:+.0f}MB, Δres={r1-r0:+.0f}MB", flush=True)
-        # ~ Experiment: filter low score
-        if "drop_low_score" in self.ablate:
-            VX_drop[low_drop_mask] = -1  # low-score token 不分配 voxel id
-        # 写入本层 voxel 池（按段并行 append + 触发合并）
+        # write to voxel pool (segment-parallel append + trigger merge)
 
-        num_voxels = self._vm.get_voxel_keys().shape[0]  # 当前有效 voxel 数
+        num_voxels = self._vm.get_voxel_keys().shape[0]  # current valid voxel count
         if self._vk_conf["backend"] == "cuda":
             mode = "cuda"    # seg vs. contiguous resolved inside merger via is_seg_mode
         else:
@@ -517,7 +486,7 @@ class STACVoxelKV(HeavyHittersKV):
                   f"alloc={a_post:.0f}MB, reserved={r_post:.0f}MB", flush=True)
 
         # Free drop tensors to reclaim transient memory
-        del K_drop, V_drop, S_drop, I_drop, VX_drop, low_drop_mask
+        del K_drop, V_drop, S_drop, I_drop, VX_drop
         del keep_mask, drop_mask_all
 
         if _MEM_PROFILE:
@@ -617,14 +586,14 @@ class STACVoxelKV(HeavyHittersKV):
 
     def _pool_drops_vectorized(self, slot_idx: int, all_keep_tokens: torch.Tensor, device: torch.device):
         """
-        将将要被 prune 掉的 token（按 head 各不相同）整批写入该层的 VoxelKVStore 的 buffer，
-        并在满足阈值时触发“分段并行”的 merge（不重融合既有 pivots）。
+        Batch-write tokens that will be pruned (per-head) into this layer's VoxelKVStore buffer,
+        and trigger segment-parallel merge when threshold is met (no re-merge of existing pivots).
         """
         layer_idx = self._managed_layers[slot_idx]
         if not self._voxelize_list[slot_idx]:
             return
 
-         # --- 准备被丢弃的 token 数据 ---
+        # --- prepare dropped token data ---
         H, D = self.num_heads, self.head_dim
         T = self._offset_hot[slot_idx]
         TV = self._offset_voxel[slot_idx]
@@ -635,14 +604,14 @@ class STACVoxelKV(HeavyHittersKV):
         if T == 0:
             return
 
-        # hot 中当前可见的 K/V/I/VX
+        # current visible K/V/I/VX in hot
         K = self.key_cache_hot[slot_idx,:, :T, :]
         V = self.value_cache_hot[slot_idx,:, :T, :]
         S = self._scores_hot[slot_idx,:, :T]
         I_mat = self._token_indices_hot[slot_idx,:, :T].to(device)
         VX = self._token_voxel_indices[slot_idx,:, :T].to(device)  # [H,T] int32
 
-        # 计算 drop mask（按 head）
+        # compute drop mask (per head)
         keep_mask = torch.zeros(H, T, dtype=torch.bool, device=device)
         keep_mask.scatter_(1, all_keep_tokens, True)
         drop_mask_all = ~keep_mask # [H,T] bool
@@ -653,39 +622,18 @@ class STACVoxelKV(HeavyHittersKV):
         if T_d == 0:
             return
 
-        score_thresh = 0.01
         S_drop  = S[drop_mask_all].view(H, T_d).contiguous().to(torch.float32)
-        low_drop_mask = torch.zeros_like(S_drop, dtype=torch.bool)
-        low_drop_mask = S_drop <= score_thresh # [H,T] bool
-        # 抽取被丢弃片段（保持 [H, Td, *]）
+        # extract dropped segments (keep [H, Td, *])
         K_drop  = K[drop_mask_all].view(H, T_d, D).contiguous()
         V_drop  = V[drop_mask_all].view(H, T_d, D).contiguous()
         I_drop  = I_mat[drop_mask_all].view(H, T_d).contiguous()
         VX_drop = VX[drop_mask_all].view(H, T_d).contiguous().to(torch.int32)
-        #~ Experiment: filter low score
-        if "drop_low_score" in self.ablate:
-            VX_drop[low_drop_mask] = -1  # low-score token 不分配 voxel id
 
-        # # sort by score descending , voxel-wise
-        # sort_scores, sort_indices = torch.sort(S_drop, dim=1, descending=True)
-        # K_drop = torch.gather(K_drop, 1, sort_indices.unsqueeze(2).expand(-1, -1, D))
-        # V_drop = torch.gather(V_drop, 1, sort_indices.unsqueeze(2).expand(-1, -1, D))
-        # S_drop = sort_scores
-        # I_drop = torch.gather(I_drop, 1, sort_indices)
-        # VX_drop = torch.gather(VX_drop, 1, sort_indices)
 
-        # # sort by voxel id ascending , head-wise
-        # sort_voxels, sort_indices = torch.sort(VX_drop, dim=1, descending=False, stable=True)
-        # K_drop = torch.gather(K_drop, 1, sort_indices.unsqueeze(2).expand(-1, -1, D))
-        # V_drop = sort_voxels
-        # S_drop = torch.gather(S_drop, 1, sort_indices)
-        # I_drop = torch.gather(I_drop, 1, sort_indices)
-        # VX_drop = torch.gather(VX_drop, 1, sort_indices)
-
-        # 写入本层 voxel 池（按段并行 append + 触发合并）
-        #TODO: consider filter low-score or low-count tokens before insert
+        # write to this layer's voxel pool (segment-parallel append + trigger merge)
+        # TODO: consider filter low-score or low-count tokens before insert
         vstore = self._vstores[slot_idx]
-        num_voxels = self._vm.get_voxel_keys().shape[0]  # 当前有效 voxel 数
+        num_voxels = self._vm.get_voxel_keys().shape[0]  # current valid voxel count
         if hasattr(self._vm, '_voxel_zones') and self._vm._voxel_zones.numel() > 0:
             vstore.update_voxel_zones(self._vm._voxel_zones)
         insert_merge_time = vstore.insert_and_merge(K_new=K_drop, V_new=V_drop, 
@@ -723,7 +671,7 @@ class STACVoxelKV(HeavyHittersKV):
         conf = kwargs.copy()
         L,H = self._L_eff, self.num_heads
 
-        # --- 选择 voxel 集合 ---
+        # --- select voxel set ---
         voxel_ids: Optional[torch.Tensor] = conf.pop("voxel_ids", None)
         return_buf: bool = conf.pop("return_buf", False)
         if voxel_ids is None:
@@ -768,7 +716,7 @@ class STACVoxelKV(HeavyHittersKV):
         for slot_idx in range(L):
             if not self._voxelize_list[slot_idx]:
                 continue
-            # --- 回填到 retrieved cache（覆盖式） ---
+            # --- backfill to retrieved cache (overwrite) ---
             self._clear_retrieval_cache(slot_idx)
             Tm = K_ret.shape[1]
             if self.retrieval_token_size>=0:
@@ -785,10 +733,7 @@ class STACVoxelKV(HeavyHittersKV):
             # [H,Tm,D]
             self.key_cache_retrieval[slot_idx] = K_ret[slot_idx*H:(slot_idx+1)*H, :Tm, :].contiguous()
             self.value_cache_retrieval[slot_idx] = V_ret[slot_idx*H:(slot_idx+1)*H, :Tm, :].contiguous()
-            if "no_bias" in self.ablate:
-                self._bias_retrieval[slot_idx] = torch.zeros(H, Tm, device=self.device, dtype=torch.float32)
-            else:
-                self._bias_retrieval[slot_idx] = B_ret[slot_idx*H:(slot_idx+1)*H, :Tm].contiguous()
+            self._bias_retrieval[slot_idx] = B_ret[slot_idx*H:(slot_idx+1)*H, :Tm].contiguous()
             self._offset_retrieval[slot_idx] = Tm
 
             def _logits_to_count(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -820,28 +765,27 @@ class STACVoxelKV(HeavyHittersKV):
     @torch.no_grad()
     def _retrieve_kv(self, layer_idx: int, **kwargs)-> Tuple[int, int]:
         """
-        从该层的 VoxelKVStore 检索需要的 pivots，写入 merge-cache。
+        Retrieve required pivots from this layer's VoxelKVStore and write to merge-cache.
         Strategy:
-         - 1.若 kwargs 传入 voxel_ids（Long/Int32[ M ]），直接按这些 voxel 拉取；
-         - 2.挑选所有Voxel
-         - 3.按  voxel accumulated scores（跨 head 求和）”挑选 top-M 代表性 voxel；
-         - 4.按 3d Space 位置挑选 top-M 代表性 voxel（TODO）。
-        之后调用 VoxelKVStore.retrieve() 拉取 K/V/S/I，回填到 merge cache。
-        
-        kwargs：
+         - 1. If kwargs provides voxel_ids (Long/Int32[M]), fetch those voxels directly;
+         - 2. Select all voxels;
+         - 3. Select top-M representative voxels by voxel accumulated scores (sum over heads);
+         - 4. Select top-M by 3D spatial position (TODO).
+        Then call VoxelKVStore.retrieve() to fetch K/V/S/I and backfill merge cache.
+
+        kwargs:
          - voxel_ids: Optional[Tensor[M]]
         """
         if not self._voxelize_list[layer_idx]:
             return 0, 0
         slot_idx = self._to_slot(layer_idx)
-         # --- 解析配置 ---
-        # conf = self._retr_conf.copy()
+        # --- parse config ---
         conf = kwargs.copy()
 
         vstore = self._vstores[slot_idx]
         H = self.num_heads
 
-        # --- 选择 voxel 集合 ---
+        # --- select voxel set ---
         voxel_ids: Optional[torch.Tensor] = conf.pop("voxel_ids", None)
         return_buf: bool = conf.pop("return_buf", False)
         if voxel_ids is None:
@@ -860,12 +804,12 @@ class STACVoxelKV(HeavyHittersKV):
         else:
             voxel_ids = voxel_ids.to(self.device, dtype=torch.long)
 
-        # --- 调用 VoxelKVStore.retrieve ---
+        # --- call VoxelKVStore.retrieve ---
         K_ret, V_ret, M_ret, B_ret = vstore.retrieve(
             voxel_ids=voxel_ids,
             return_buf=return_buf,
-        ) # [H,Tm,..]
-        # --- 回填到 retrieved cache（覆盖式） ---
+        )  # [H,Tm,..]
+        # --- backfill to retrieved cache (overwrite) ---
         self._clear_retrieval_cache(slot_idx)
         Tm = K_ret.shape[1]
         if self.retrieval_token_size>=0:

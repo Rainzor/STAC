@@ -144,16 +144,12 @@ def get_args_parser():
                         help="Evicted Buffer capacity for VoxelSasa KV cache management")
     parser.add_argument("--voxel_piv_cap", type=int, default=4,
                         help="Pivot capacity for VoxelSasa KV cache management")
-    parser.add_argument("--voxel_backend", type=str, default="python",
+    parser.add_argument("--voxel_backend", type=str, default="cuda",
                         choices=["cuda", "python"],
                         help="Backend type for VoxelSasa KV cache management")
-    parser.add_argument("--allocator","-alloc", type=str, default="slab", 
-                        choices=["static", "slab", "segment"], 
+    parser.add_argument("--allocator","-alloc", type=str, default="segment",
+                        choices=["static", "slab", "segment"],
                         help="Allocator type for VoxelSasa Merge KV cache")
-    
-    parser.add_argument("--ablate", nargs="*", default=[],
-                        help="Ablation settings for evaluation")
-
     return parser
 
 
@@ -168,7 +164,6 @@ def run(images, model, dtype, device, args):
     
     model_kwargs = {
         "cam_cache_update": args.use_cam_cache,
-        "max_frames": frame_num+1,
         "window_size": args.window_size,
         "hh_size": args.hh_size,
         "retrieval_size": args.retrieval_size,
@@ -183,7 +178,6 @@ def run(images, model, dtype, device, args):
         "chunk_size": args.chunk_size,
         "allocator": args.allocator,
         "pinned_frame_indices": args.pinned,
-        "ablate": args.ablate,
     }
     with torch.no_grad():
         with torch.amp.autocast(

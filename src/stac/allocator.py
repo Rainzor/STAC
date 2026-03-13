@@ -1,3 +1,5 @@
+# Copyright (c) 2025 STAC Authors. All rights reserved.
+
 from typing import List, Optional, Tuple, Union, Dict
 from abc import ABC, abstractmethod
 import enum

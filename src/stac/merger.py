@@ -1,3 +1,5 @@
+# Copyright (c) 2025 STAC Authors. All rights reserved.
+
 from typing import Optional, Tuple, Union, Dict, Literal
 import math
 import os

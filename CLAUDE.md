@@ -16,17 +16,18 @@ pip install -r requirements.txt
 
 # Optional: CUDA KV merger (requires CUDA_HOME set)
 export CUDA_HOME=/usr/local/cuda-12.8
-cd merger-cuda && pip install -e . && cd ..
+pip install -e merger-cuda --no-build-isolation
 ```
 
-Checkpoints go under `ckpt/{stream3r,streamvggt,vggt}/model.pt`.
+Checkpoints go under `ckpt/{stream3r,streamvggt,vggt}/` as `model.safetensors` or `model.pt` (auto-detected by `model_wrapper`).
 
 ## Common Commands
 
 ```bash
-# Single scene inference
-python main.py --scene_dir /path/to/scene --model_name causalvggt --base_model stream3r \
-    --mode window_chunk_merge --streaming --size 518
+# Single-scene / few scenes: use eval launch with dataset_type + optional scene_name (main.py is legacy, no causalvggt)
+python eval/long_recon/launch.py --output_dir eval_recon --dataset_type NRGBD --scene_name complete_kitchen \
+    --model_name causalvggt --base_model stream3r --mode window_chunk_merge --streaming \
+    -win 4 -ck 4 -hh 2 -ret_sz 2 -ret_buf --save_tag stac
 
 # Evaluation - 3D reconstruction
 python eval/long_recon/launch.py --output_dir eval_recon --dataset_type NRGBD \
@@ -62,10 +63,12 @@ python demo/demo_colmap.py --scene_dir /path/to/scene --output_dir output/colmap
 
 ### Two entry points
 
-- **`main.py`** — Legacy standalone CLI. Imports models directly from `src/` subpackages (vggt, stream3r, sparsevggt, streamvggt). Simpler but fewer features.
-- **`src/model_wrapper.py`** — Unified `load_model(model_name, base_model)` / `run_model()` API used by evaluation scripts. Routes through `CausalVGGT` adapter with `StreamSession` for streaming.
+- **`main.py`** — Legacy standalone CLI. Uses `stream3r` / `vggt` / `streamvggt` / `sparsevggt` only (no causalvggt); imports from `stream3r.stream_session` and backbone packages. For STAC + causalvggt use eval scripts or the Python API (see README).
+- **`src/model_wrapper.py`** — Unified `load_model(model_name, base_model)` / `run_model()` API used by evaluation scripts. Supports `model_name=causalvggt` with `StreamSession` from `src/stream_session.py` for streaming.
 
 ### Core components (`src/`)
+
+- **`src/stream_session.py`** — `StreamSession` orchestrates frame-by-frame streaming: feeds frames, manages KV cache lifecycle (append → attention → prune → retrieve), accumulates predictions
 
 - **`src/causalvggt/`** — Backbone-agnostic CausalVGGT adapter
   - `models/vggt.py` — `CausalVGGT` model class, wraps backbone weights selected by `base_model` param
@@ -73,7 +76,6 @@ python demo/demo_colmap.py --scene_dir /path/to/scene --output_dir output/colmap
   - `layers/attention.py` — `SparseAttention` implementing all attention modes (full, causal, window, window_kv, window_chunk, window_merge, window_chunk_merge)
   - `layers/block.py` — Transformer block with RoPE
   - `heads/` — CameraHead (extrinsic+intrinsic), DPTHead (depth, point maps)
-  - `stream_session.py` — `StreamSession` orchestrates frame-by-frame streaming: feeds frames, manages KV cache lifecycle (append → attention → prune → retrieve), accumulates predictions
 
 - **`src/stac/`** — STAC KV-cache management (plug-and-play, independent of backbone)
   - `kv_manager.py` — `KVManager` base class: window-based KV cache with recent+pinned token slots, GPU/CPU buffer split

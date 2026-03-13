@@ -11,7 +11,7 @@ logger = logging.getLogger("model wrapper")
 
 
 # Core imports (always required)
-from causalvggt.stream_session import StreamSession
+from stream_session import StreamSession
 from causalvggt.models.vggt import CausalVGGT
 
 # Optional imports for other model types
@@ -98,15 +98,12 @@ def run_model(model, images, model_name, mode='full',
             logger.info("Using streaming mode for CausalVGGT.")
             if mode == "full":
                 logger.warning("Warning: you are trying to use 'full' attention mode with streaming, which will cause high memory usage.")
-            max_frames = kwargs.get("max_frames",50)
             cam_cache_update = kwargs.get("cam_cache_update", True)
-            kwargs.pop("max_frames", None)
             kwargs.pop("cam_cache_update", None)
             session:StreamSession = stream_sessions[model_name](
-                                                        model, 
+                                                        model,
                                                         device=device,
-                                                        cam_cache_update=cam_cache_update,
-                                                        max_frames=max_frames)
+                                                        cam_cache_update=cam_cache_update)
             
             session.pipeline(images, mode=mode,
                              dtype=dtype, device=device,

@@ -86,8 +86,6 @@ def get_args_parser():
 
     parser.add_argument("--mode", type=str, default="full",
                         help="Processing mode")
-    parser.add_argument("--max_kv_size", type=int, default=-1,
-                        help="Maximum number of frames to process (-1 for all)")
     parser.add_argument("--pose_eval_stride",
                         default=1,
                         type=int,
@@ -112,16 +110,14 @@ def get_args_parser():
                         help="Voxel size for VoxelSasa KV cache management")
     parser.add_argument("--voxel_num", type=int, default=4096,
                         help="Initial number of voxels for VoxelSasa KV cache management")
-    parser.add_argument("--allocator","-alloc", type=str, default="slab", 
-                        choices=["static", "slab", "segment", "compact"], 
+    parser.add_argument("--voxel_backend", type=str, default="cuda",
+                        choices=["cuda", "python"],
+                        help="Backend type for voxel KV cache management")
+    parser.add_argument("--allocator","-alloc", type=str, default="segment",
+                        choices=["static", "slab", "segment", "compact"],
                         help="Allocator type for VoxelSasa Merge KV cache")
-    parser.add_argument("--kvcache_patch", type=int, default=1,
-                        help="Number of patches per keyframe in KV cache (for H2O attention)")
     parser.add_argument("--pinned", type=int, default=[0], nargs="+",
                         help="List of pinned frame indices (default: [0])")
-    
-    parser.add_argument("--ablate", nargs="*", default=[],
-                        help="Ablation settings for evaluation")
     return parser
 
 
@@ -139,7 +135,6 @@ def run(images, model, dtype, device, args):
 
     model_kwargs = {
         "tag": args.vis_tag,
-        "max_frames": args.max_kv_size if args.max_kv_size > 0 else frame_num+1,
         "window_size": args.window_size,
         "hh_size": args.hh_size,
         "retrieval_size": args.retrieval_size,
@@ -148,11 +143,10 @@ def run(images, model, dtype, device, args):
         "voxel_size": args.voxel_size,
         "voxel_num": args.voxel_num,
         "conf_threshold": args.voxel_conf,
+        "voxel_backend": args.voxel_backend,
         "chunk_size": args.chunk_size,
         "allocator": args.allocator,
-        "kvcache_patch_size": args.kvcache_patch,
         "pinned_frame_indices": args.pinned,
-        "ablate": args.ablate,
     }
     with torch.no_grad():
         with torch.amp.autocast(device_type="cuda", dtype=dtype):
@@ -196,7 +190,6 @@ def run(images, model, dtype, device, args):
         "base_model": args.base_model,
         "mode": args.mode,
         "streaming": args.streaming,
-        "ablate": args.ablate,
     }
 
     if "window" in args.mode:
@@ -204,7 +197,6 @@ def run(images, model, dtype, device, args):
         if args.streaming:
             model_stats["hh_size"] = args.hh_size
             model_stats["retrieval_size"] = args.retrieval_size
-            model_stats["kvcache_patch_size"] = args.kvcache_patch
             model_stats["chunk_size"] = args.chunk_size
             model_stats["pinned_frame_indices"] = args.pinned
             model_stats["temperature"] = args.temperature

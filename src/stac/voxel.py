@@ -1,3 +1,5 @@
+# Copyright (c) 2025 STAC Authors. All rights reserved.
+
 from typing import Optional, Tuple, Dict
 import math
 import torch
@@ -321,7 +323,7 @@ class BinaryVoxel:
 
         return voxel_id_valid
 
-    # =============== 邻域 offset 缓存 ===============
+    # =============== neighbor offset cache ===============
     def _ensure_neighbor_offset_cache(self, R: int):
         """
         Precompute and cache all 3D lattice neighbor offsets for Chebyshev radius R:
@@ -330,7 +332,7 @@ class BinaryVoxel:
           - self._nbr_offsets_1d[R]:   [M]  int64 packed offsets (add to 1D key)
           - self._nbr_offsets_xyz[R]:  [M,3] int32 lattice deltas (dx,dy,dz)
           - self._nbr_sqdist_lattice[R]: [M] float32 (dx^2+dy^2+dz^2)
-          - self._nbr_zero_idx[R]: index of (dx,dy,dz)=(0,0,0) in the above (for剔除自身)
+          - self._nbr_zero_idx[R]: index of (dx,dy,dz)=(0,0,0) in the above (for excluding self)
         """
         if not hasattr(self, "_nbr_offsets_1d"):
             self._nbr_offsets_1d: Dict[int, torch.Tensor] = {}
@@ -345,18 +347,18 @@ class BinaryVoxel:
         sY = (1 << 21)
         sZ = (1 << 42)
 
-        # 生成 [-R, R]^3 的整点偏移（包含自身 0,0,0）
+        # generate integer offsets for [-R, R]^3 (including self 0,0,0)
         rng = torch.arange(-R, R + 1, device=device, dtype=torch.int32)
         dx, dy, dz = torch.meshgrid(rng, rng, rng, indexing='ij')   # [2R+1]^3
         xyz = torch.stack([dx, dy, dz], dim=-1).reshape(-1, 3).contiguous()  # [M,3]
-        # 1D 可加性偏移
+        # 1D additive offsets
         off1d = (xyz[:, 0].to(torch.int64)
                  + xyz[:, 1].to(torch.int64) * sY
                  + xyz[:, 2].to(torch.int64) * sZ)  # [M]
-        # 格点平方距离（与实际欧氏距离只差一个 voxel_size^2 的缩放）
+        # lattice squared distance (Euclidean distance up to voxel_size^2 scale)
         sqd_lat = (xyz.to(torch.float32) ** 2).sum(dim=-1)  # [M]
 
-        # 记录 0 偏移的索引
+        # index of zero offset
         zero_idx = torch.where((xyz == 0).all(dim=-1))[0]
         zero_idx = int(zero_idx.item()) if zero_idx.numel() > 0 else None
 
@@ -365,27 +367,27 @@ class BinaryVoxel:
         self._nbr_sqdist_lattice[R] = sqd_lat
         self._nbr_zero_idx[R] = zero_idx
 
-    # =============== 新增：批量 key → id 查找（缺失返回 -1） ===============
+    # =============== batch key -> id lookup (missing returns -1) ===============
     @torch.no_grad()
     def _lookup_ids_by_keys(self, keys_1d: torch.Tensor) -> torch.Tensor:
         """
         keys_1d: [...], int64
-        返回: 同形状 int32，存在的为稳定 voxel_id，不存在的为 -1
+        Returns: same shape int32; stable voxel_id where present, -1 where missing
         """
         if keys_1d.numel() == 0:
             return torch.empty_like(keys_1d, dtype=torch.int32)
 
-        # 保证有排序缓存
+        # ensure sorted cache
         if self._voxel_keys_1d_sorted.numel() == 0 and self._voxel_keys_1d.numel() > 0:
             sorted_keys, sort_idx = torch.sort(self._voxel_keys_1d)
             self._voxel_keys_1d_sorted = sorted_keys
             self._voxel_keys_sort_idx = sort_idx
 
         if self._voxel_keys_1d_sorted.numel() == 0:
-            # 主表为空，全部 -1
+            # master table empty; return all -1
             return torch.full_like(keys_1d, -1, dtype=torch.int32)
 
-        # 向量化定位
+        # vectorized lookup
         pos = torch.searchsorted(self._voxel_keys_1d_sorted, keys_1d)
         pos = pos.clamp_(0, self._voxel_keys_1d_sorted.numel() - 1)
         match = (self._voxel_keys_1d_sorted.index_select(0, pos) == keys_1d)
@@ -396,7 +398,7 @@ class BinaryVoxel:
             out[match] = ids
         return out
 
-    # =============== 主接口：按 voxel_id 查询 k 邻居（欧氏距离） ===============
+    # =============== main API: k nearest neighbors by voxel_id (Euclidean distance) ===============
     @torch.no_grad()
     def knn_by_id(self,
                   voxel_ids: torch.Tensor,     # [Q] int32
@@ -406,15 +408,15 @@ class BinaryVoxel:
                   return_squared_dist: bool = True
                   ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        给定查询 voxel_id，返回其周围 Top-k 邻居（欧氏距离）。
-        采用 Chebyshev 立方邻域 [-R,R]^3 做候选，向量化查表 + 距离筛选。
-        - 如果 max_radius_cells 未指定，则按 k 自动选择最小 R，使 (2R+1)^3 >= k + (include_self?1:0) + 余裕。
-        - 若某些查询在该 R 下不足 k 个存在邻居，则这些位置用 -1 填充，距离用 +inf。
+        Given query voxel_id, return its top-k neighbors (Euclidean distance).
+        Uses Chebyshev cube neighborhood [-R,R]^3 as candidates; vectorized lookup + distance filter.
+        - If max_radius_cells not set, choose minimal R so (2R+1)^3 >= k + (include_self?1:0) + margin.
+        - If a query has fewer than k existing neighbors at that R, fill with -1 and +inf.
 
         Returns:
-            nbr_ids:  [Q, k] int32   （不存在的为 -1）
-            nbr_dist: [Q, k] float32 （对应距离；若 return_squared_dist=True，则为 d^2）
-            found:    [Q]   int32    （每个查询实际找到的邻居数量，不含自身）
+            nbr_ids:  [Q, k] int32   (missing = -1)
+            nbr_dist: [Q, k] float32 (distance; d^2 if return_squared_dist=True)
+            found:    [Q]   int32    (actual neighbor count per query, excluding self)
         """
         assert voxel_ids.dtype in (torch.int32, torch.int64), "voxel_ids must be int32/64"
         device = self.device
@@ -424,13 +426,12 @@ class BinaryVoxel:
                     torch.empty(Q, 0, dtype=torch.float32, device=device),
                     torch.zeros(Q, dtype=torch.int32, device=device))
 
-        # 计算合适的 R
+        # choose R
         if max_radius_cells is None:
-            # 最小 R 使候选格点数 >= k + (是否包含自身)
+            # minimal R so candidate lattice count >= k + (include_self?1:0)
             need = k + (1 if include_self else 0)
-            # ceil(((need)^(1/3) - 1) / 2)
             R = int(torch.ceil(((torch.tensor(float(need), device=device) ** (1.0 / 3.0)) - 1.0) / 2.0).item())
-            R = max(1, R)  # 至少 1
+            R = max(1, R)  # at least 1
         else:
             R = int(max_radius_cells)
             R = max(1, R)
@@ -441,67 +442,67 @@ class BinaryVoxel:
         zero_idx = self._nbr_zero_idx[R]              # int
         M = int(off1d.numel())
 
-        # 查询键
+        # query keys
         q_ids = voxel_ids.to(torch.int64)
-        # 越界保护
+        # bounds check
         valid_q = (q_ids >= 0) & (q_ids < self._voxel_keys_1d.numel())
         keys_q = torch.empty(Q, dtype=torch.int64, device=device)
         keys_q[valid_q] = self._voxel_keys_1d[q_ids[valid_q]]
-        keys_q[~valid_q] = -9223372036854775808  # 无效 key（不会匹配）
+        keys_q[~valid_q] = -9223372036854775808  # invalid key (no match)
 
-        # 候选键矩阵 [Q, M]
-        cand_keys = keys_q.view(Q, 1) + off1d.view(1, M)  # 广播加法
+        # candidate key matrix [Q, M]
+        cand_keys = keys_q.view(Q, 1) + off1d.view(1, M)  # broadcast add
 
-        # 一次性查 id，得到 [Q, M]
+        # batch lookup ids -> [Q, M]
         cand_ids = self._lookup_ids_by_keys(cand_keys.view(-1)).view(Q, M)  # int32
-        # 距离矩阵（单位：米），缺失项设为 +inf
-        #   欧氏距离^2 = (dx^2+dy^2+dz^2) * voxel_size^2
+        # distance matrix (meters); missing entries +inf
+        #   Euclidean^2 = (dx^2+dy^2+dz^2) * voxel_size^2
         vs = float(self._voxel_size.item())
-        d2 = sqd_lat.view(1, M) * (vs * vs)                      # [1, M] → [Q, M] 广播
+        d2 = sqd_lat.view(1, M) * (vs * vs)           # [1, M] -> [Q, M] broadcast
         d2 = d2.expand(Q, M).clone()
 
-        # 不存在的候选 → +inf
+        # missing candidates -> +inf
         missing = (cand_ids < 0)
         d2[missing] = float('inf')
 
-        # 是否剔除自身
+        # exclude self
         if not include_self and (zero_idx is not None):
             d2[:, zero_idx] = float('inf')
 
-        # 选取 top-k 最近（距离最小）
-        # 注意：如果有效邻居少于 k，topk 会返回若干 +inf；我们随后把 +inf 的 id 置 -1
+        # top-k nearest (smallest distance)
+        # if fewer than k valid neighbors, topk returns +inf; we set those ids to -1
         top_vals, top_idx = torch.topk(d2, k=min(k, M), dim=1, largest=False, sorted=True)  # [Q, k]
         nbr_ids = cand_ids.gather(1, top_idx)  # [Q, k]
 
-        # 把 +inf 的位置标记为 -1
+        # mark +inf positions as -1
         inf_mask = torch.isinf(top_vals)
         if inf_mask.any():
             nbr_ids = nbr_ids.masked_fill(inf_mask, -1)
 
-        # 每个查询实际找到的邻居数（不含自身）
+        # actual neighbor count per query (excluding self)
         found = (~inf_mask).sum(dim=1).to(torch.int32)
 
         if return_squared_dist:
             nbr_dist = top_vals.to(torch.float32)
         else:
-            # 开根号时保持 +inf 仍为 +inf
+            # sqrt preserves +inf
             nbr_dist = torch.sqrt(top_vals).to(torch.float32)
 
         return nbr_ids.to(torch.int32), nbr_dist, found
 
-    # =============== Public API：按「米」设置半径（返回半径内全部 id，最多 M 个） ===============
+    # =============== Public API: radius in meters (return all ids within radius, up to M) ===============
     @torch.no_grad()
     def neighbors(self,voxel_ids: torch.Tensor,
                     radius_m: float,
                     include_self: bool = False
                     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        给定以米为单位的半径，枚举 Chebyshev 半径 R = ceil(radius_m / voxel_size)，
-        返回该立方邻域内的所有存在体素（上限 M=(2R+1)^3）。
-        返回：
-            nbr_ids:  [Q, M]  （不存在为 -1；若不含自身，自身距离位置会是 -1）
-            dist2:    [Q, M]  （米^2，缺失为 +inf）
-            found:    [Q]     实际存在数量（不含自身）
+        Given radius in meters, set Chebyshev radius R = ceil(radius_m / voxel_size)
+        and return all existing voxels in that cube (cap M=(2R+1)^3).
+        Returns:
+            nbr_ids:  [Q, M]  (missing = -1; self position -1 if not include_self)
+            dist2:    [Q, M]  (meters^2, missing = +inf)
+            found:    [Q]     actual count (excluding self)
         """
         vs = float(self._voxel_size.item())
         R = max(1, int(torch.ceil(torch.tensor(radius_m / vs)).item()))
@@ -509,7 +510,7 @@ class BinaryVoxel:
 
         off1d = self._nbr_offsets_1d[R]
         M = int(off1d.numel())
-        # 借助 knn_by_id 的内部流程：用 k=M 即获取“所有候选中的有效者”
+        # use knn_by_id with k=M to get all valid candidates
         nbr_ids, dist2, found = self.knn_by_id(
             voxel_ids=voxel_ids,
             k=M,

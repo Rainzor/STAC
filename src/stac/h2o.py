@@ -1,3 +1,5 @@
+# Copyright (c) 2025 STAC Authors. All rights reserved.
+
 from typing import List, Optional, Tuple
 import torch
 import torch.nn.functional as F
@@ -5,6 +7,8 @@ import numpy as np
 import warnings
 from .kv_manager import KVManager
 from .flash_attn_triton import fa_forward_colsum_fast
+
+
 class HeavyHittersKV(KVManager):
     """
     H2O-style KV selector with **token-level** grouping.
@@ -64,11 +68,10 @@ class HeavyHittersKV(KVManager):
     def reset(self):
         super().reset()
         self._processed_frames = 0
-        # 每层一个 [H, 0] 的 LongTensor, intialize with -1
-
+        # per-layer [H, 0] LongTensor, initialize with -1
         self._scores_hot = torch.zeros((self._L_eff, self.num_heads, self.reserved_buffer_token_size), dtype=torch.float32, device=self.device)
         self._scores_hot_count = torch.zeros((self._L_eff, self.num_heads, self.reserved_buffer_token_size), dtype=torch.float32, device=self.device)
-        # 记录“已评分的长度”
+        # track scored length
         self._last_score_offset = [0] * self._L_eff
         self._last_query_offset = [0] * self._L_eff
 
@@ -159,21 +162,21 @@ class HeavyHittersKV(KVManager):
         assert T_live <= self.reserved_buffer_token_size, f"T_live({T_live}) > reserved_buffer_token_size({self.reserved_buffer_token_size})"
 
         scores_hot = self._scores_hot[slot_idx]  # [H, buffer_T]
-        # ---- 1. 新尾部 (persist mask + direct write) ----
+        # ---- 1. new tail (persist mask + direct write) ----
         new_T = T_live - old_T
         s_scale = self.temperature
         scores_count = self._scores_hot_count[slot_idx]  # [H, buffer_T]
 
-        if new_T > 0: # self attention 计算出了新 token 的 score
+        if new_T > 0:  # self-attention produced scores for new tokens
             start = old_T
             end = T_live
             scores_hot[:, start:end].copy_(s[:, start:end])
-        # ---- 2. 老前缀累积 (in-place fused op) ----
-        if old_T > 0:     
-            scores_hot[:, :old_T].mul_(s_scale).add_(s[:, :old_T])   
-        scores_count[:, :T_live].add_(1.0)      
+        # ---- 2. old prefix accumulation (in-place fused op) ----
+        if old_T > 0:
+            scores_hot[:, :old_T].mul_(s_scale).add_(s[:, :old_T])
+        scores_count[:, :T_live].add_(1.0)
 
-        # ---- 3. 更新边界 ----
+        # ---- 3. update boundary ----
         self._last_score_offset[slot_idx] = T_live
 
     # def prune_kv(self):
@@ -295,18 +298,11 @@ class HeavyHittersKV(KVManager):
             scores_all = self._scores_hot[:L, :, :T_tokens]                  # [L, H, T]
             scores_prefix = scores_all.index_select(dim=2, index=prefix_idx) # [L, H, N_prefix]
             N_prefix = prefix_idx.numel()
-            #~ Expriment Random selection:
-            if "random_sel" in self.ablate:
-                rand_scores = torch.rand(L, H, N_prefix, device=device)          # [L, H, N_prefix]
-                # random selection within prefix for each (L, H)
-                idx_in_prefix = rand_scores.argsort(dim=-1)[..., :desired_hh_k]   # [L, H, desired_hh_k]
-            else:
-                # Top-k within prefix for each (L, H)
-                _, idx_in_prefix = torch.topk(
-                    scores_prefix,
-                    k=desired_hh_k,
-                    dim=-1
-                )  # [L, H, desired_hh_k]
+            _, idx_in_prefix = torch.topk(
+                scores_prefix,
+                k=desired_hh_k,
+                dim=-1
+            )  # [L, H, desired_hh_k]
 
             # Map back to original token indices
             hh_idx = prefix_idx[idx_in_prefix]                               # [L, H, desired_hh_k]
@@ -491,8 +487,8 @@ class HeavyHittersKV(KVManager):
 
     def _apply_keep_and_compact(self, slot_idx: int, keep_idx_h: torch.Tensor):
         """
-        keep_idx_h: [H, T'] 每个 head 的保留 token 索引。
-        并行 gather 版，无需 head 循环。
+        keep_idx_h: [H, T'] kept token indices per head.
+        Parallel gather version; no per-head loop.
         """
         H, Tprime = keep_idx_h.shape
         K = self.key_cache_hot[slot_idx]          # [H, T, D]
