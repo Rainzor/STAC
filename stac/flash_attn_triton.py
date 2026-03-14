@@ -639,3 +639,563 @@ def fa_forward_colsum_fast(q, k, v, bias=None, causal=False, softmax_scale=None,
 
     return (out if write_o else None), lse, col_sum
 
+
+#& -----------------------------
+#& Fused LSE + O + partial ColSum kernel  [m-major, split-K]
+#& Pass 1: streaming softmax → LSE + O  (identical to _fwd_lse_o_kernel)
+#& Pass 2: reuse Q (regs) + lse_i (regs), re-sweep K (L2-cached) → partial colsum
+#&         stored per (pid_m, off_hb) — no atomics needed.
+#& -----------------------------
+@triton.heuristics({
+    "EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
+    "EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
+    "EVEN_HEADDIM": lambda args: args["headdim"] == args["BLOCK_HEADDIM"],
+})
+@triton.jit
+def _fwd_lse_o_partial_colsum_kernel(
+    Q, K, V, Bias, Out, LSE, TMP,
+    PartialColSum,
+    softmax_scale,
+    stride_qb, stride_qh, stride_qm,
+    stride_kb, stride_kh, stride_kn,
+    stride_vb, stride_vh, stride_vn,
+    stride_bb, stride_bh, stride_bm,
+    stride_ob, stride_oh, stride_om,
+    stride_ps, stride_phb,
+    nheads, seqlen_q, seqlen_k, seqlen_q_round, headdim,
+    BIAS_TYPE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    WRITE_O: tl.constexpr,
+    BLOCK_HEADDIM: tl.constexpr,
+    EVEN_M: tl.constexpr, EVEN_N: tl.constexpr, EVEN_HEADDIM: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    off_hb = tl.program_id(1)
+    off_b = off_hb // nheads
+    off_h = off_hb % nheads
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_HEADDIM)
+
+    q_ptrs = Q + off_b * stride_qb + off_h * stride_qh + (offs_m[:, None] * stride_qm + offs_d[None, :])
+    k_ptrs = K + off_b * stride_kb + off_h * stride_kh + (offs_n[:, None] * stride_kn + offs_d[None, :])
+    v_ptrs = V + off_b * stride_vb + off_h * stride_vh + (offs_n[:, None] * stride_vn + offs_d[None, :])
+
+    if BIAS_TYPE == "vector":
+        b_ptrs = Bias + off_b * stride_bb + off_h * stride_bh + offs_n
+    elif BIAS_TYPE == "matrix":
+        b_ptrs = Bias + off_b * stride_bb + off_h * stride_bh + (offs_m[:, None] * stride_bm + offs_n[None, :])
+
+    acc_o = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
+    lse_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    m_i   = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    t_ptrs = TMP + off_hb * seqlen_q_round + offs_m
+
+    if EVEN_M & EVEN_HEADDIM:
+        q = tl.load(q_ptrs)
+    else:
+        q = tl.load(q_ptrs, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0)
+
+    end_n = seqlen_k if not IS_CAUSAL else tl.minimum((pid_m + 1) * BLOCK_M, seqlen_k)
+
+    # ---- Pass 1: streaming softmax → LSE + O ----
+    for start_n in range(0, end_n, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+
+        if EVEN_N & EVEN_HEADDIM:
+            k = tl.load(k_ptrs + start_n * stride_kn)
+            if WRITE_O:
+                v = tl.load(v_ptrs + start_n * stride_vn)
+        else:
+            mask_nv = ((start_n + offs_n)[:, None] < seqlen_k) & (offs_d[None, :] < headdim)
+            k = tl.load(k_ptrs + start_n * stride_kn, mask=mask_nv, other=0.0)
+            if WRITE_O:
+                v = tl.load(v_ptrs + start_n * stride_vn, mask=mask_nv, other=0.0)
+
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        qk += tl.dot(q, tl.trans(k))
+
+        if not EVEN_N:
+            qk += tl.where((start_n + offs_n)[None, :] < seqlen_k, 0.0, float("-inf"))
+        if IS_CAUSAL:
+            qk += tl.where(offs_m[:, None] >= (start_n + offs_n)[None, :], 0.0, float("-inf"))
+
+        if BIAS_TYPE != "none":
+            if BIAS_TYPE == "vector":
+                if EVEN_N:
+                    bias = tl.load(b_ptrs + start_n).to(tl.float32)
+                else:
+                    bias = tl.load(b_ptrs + start_n, mask=(start_n + offs_n) < seqlen_k, other=0.0).to(tl.float32)
+                bias = bias[None, :]
+                qk = qk * softmax_scale + bias
+            else:
+                if EVEN_M & EVEN_N:
+                    bias = tl.load(b_ptrs + start_n).to(tl.float32)
+                else:
+                    bias = tl.load(
+                        b_ptrs + start_n,
+                        mask=(offs_m[:, None] < seqlen_q) & ((start_n + offs_n)[None, :] < seqlen_k),
+                        other=0.0,
+                    ).to(tl.float32)
+                qk = qk * softmax_scale + bias
+
+            m_ij = tl.maximum(tl.max(qk, axis=1), lse_i)
+            p = tl.exp(qk - m_ij[:, None])
+        else:
+            m_ij = tl.maximum(tl.max(qk, axis=1) * softmax_scale, lse_i)
+            p = tl.exp(qk * softmax_scale - m_ij[:, None])
+
+        l_ij = tl.sum(p, axis=1)
+
+        if WRITE_O:
+            alpha = tl.exp(m_i - m_ij)
+            tl.store(t_ptrs, alpha); alpha = tl.load(t_ptrs)
+            acc_o *= alpha[:, None]
+            p = p.to(v.dtype)
+            acc_o += tl.dot(p, v)
+
+        m_i = m_ij
+        lse_i = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
+
+    lse_ptrs = LSE + off_hb * seqlen_q_round + offs_m
+    tl.store(lse_ptrs, lse_i, mask=offs_m < seqlen_q)
+
+    if WRITE_O:
+        o_scale = tl.exp(m_i - lse_i)
+        tl.store(t_ptrs, o_scale); o_scale = tl.load(t_ptrs)
+        acc_o *= o_scale[:, None]
+
+        offs_d2 = tl.arange(0, BLOCK_HEADDIM)
+        out_ptrs = Out + off_b * stride_ob + off_h * stride_oh + (offs_m[:, None] * stride_om + offs_d2[None, :])
+        tl.store(out_ptrs, acc_o, mask=(offs_m[:, None] < seqlen_q) & (offs_d2[None, :] < headdim))
+
+    # ---- Pass 2: partial col_sum using Q (regs) + lse_i (regs), K L2-cached ----
+    ps_base = PartialColSum + pid_m * stride_ps + off_hb * stride_phb
+
+    for start_n in range(0, end_n, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+
+        if EVEN_N & EVEN_HEADDIM:
+            k = tl.load(k_ptrs + start_n * stride_kn)
+        else:
+            k = tl.load(
+                k_ptrs + start_n * stride_kn,
+                mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
+                other=0.0,
+            )
+
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        qk += tl.dot(q, tl.trans(k))
+
+        if not EVEN_N:
+            qk += tl.where((start_n + offs_n)[None, :] < seqlen_k, 0.0, float("-inf"))
+        if IS_CAUSAL:
+            qk += tl.where(offs_m[:, None] >= (start_n + offs_n)[None, :], 0.0, float("-inf"))
+
+        if BIAS_TYPE != "none":
+            if BIAS_TYPE == "vector":
+                if EVEN_N:
+                    bias2 = tl.load(b_ptrs + start_n).to(tl.float32)
+                else:
+                    bias2 = tl.load(b_ptrs + start_n, mask=(start_n + offs_n) < seqlen_k, other=0.0).to(tl.float32)
+                bias2 = bias2[None, :]
+                qk = qk * softmax_scale + bias2
+            else:
+                if EVEN_M & EVEN_N:
+                    bias2 = tl.load(b_ptrs + start_n).to(tl.float32)
+                else:
+                    bias2 = tl.load(
+                        b_ptrs + start_n,
+                        mask=(offs_m[:, None] < seqlen_q) & ((start_n + offs_n)[None, :] < seqlen_k),
+                        other=0.0,
+                    ).to(tl.float32)
+                qk = qk * softmax_scale + bias2
+
+            p_true = tl.exp(qk - lse_i[:, None])
+        else:
+            p_true = tl.exp(qk * softmax_scale - lse_i[:, None])
+
+        p_true = tl.where(offs_m[:, None] < seqlen_q, p_true, 0.0)
+        if not EVEN_N:
+            p_true = tl.where((start_n + offs_n)[None, :] < seqlen_k, p_true, 0.0)
+
+        partial_cs = tl.sum(p_true, axis=0)
+
+        tl.store(ps_base + start_n + offs_n, partial_cs, mask=(start_n + offs_n) < seqlen_k)
+
+    if IS_CAUSAL:
+        for start_n in range(end_n, seqlen_k, BLOCK_N):
+            start_n = tl.multiple_of(start_n, BLOCK_N)
+            tl.store(
+                ps_base + start_n + offs_n,
+                tl.zeros([BLOCK_N], dtype=tl.float32),
+                mask=(start_n + offs_n) < seqlen_k,
+            )
+
+
+#& -----------------------------
+#& Reduce partial col_sum along M-block dimension
+#& -----------------------------
+@triton.jit
+def _reduce_partial_colsum_kernel(
+    PartialColSum, ColSum,
+    stride_ps, stride_phb,
+    stride_cb, stride_ch, stride_cn,
+    num_m_blocks, nheads, seqlen_k,
+    BLOCK_R: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    off_hb = tl.program_id(1)
+    off_b = off_hb // nheads
+    off_h = off_hb % nheads
+
+    offs_n = pid_n * BLOCK_R + tl.arange(0, BLOCK_R)
+    mask_n = offs_n < seqlen_k
+
+    acc = tl.zeros([BLOCK_R], dtype=tl.float32)
+    base = off_hb * stride_phb
+    for i in range(num_m_blocks):
+        vals = tl.load(PartialColSum + i * stride_ps + base + offs_n, mask=mask_n, other=0.0)
+        acc += vals
+
+    c_ptrs = ColSum + off_b * stride_cb + off_h * stride_ch + offs_n * stride_cn
+    tl.store(c_ptrs, acc, mask=mask_n)
+
+
+def fa_forward_colsum_fast_beta(q, k, v, bias=None, causal=False, softmax_scale=None, write_o=True):
+    """Split-K + reduce: fused LSE+O+partial_colsum kernel + lightweight reduce.
+
+    Same signature and return type as fa_forward_colsum_fast.
+    """
+    assert q.is_cuda and q.dtype in (torch.float16, torch.bfloat16), f"q dtype {q.dtype} not supported"
+    B, M, H, D = q.shape
+    N = k.shape[1]
+    assert k.shape == (B, N, H, D) and v.shape == (B, N, H, D)
+
+    scale = softmax_scale or (1.0 / math.sqrt(D))
+
+    bias_type = "none"
+    b_strides = (0, 0, 0)
+    if bias is not None:
+        if bias.stride(-1) != 1:
+            bias = bias.contiguous()
+        if bias.shape[2:] == (1, N):
+            bias_type = "vector"
+            bias = bias.expand(B, H, M, N)
+        elif bias.shape[2:] == (M, N):
+            bias_type = "matrix"
+        else:
+            raise RuntimeError("bias last two dims must be (1,N) or (M,N)")
+        b_strides = (bias.stride(0), bias.stride(1), bias.stride(2))
+
+    BLOCK_M = 128
+    BLOCK_N = 128
+    M_rounded = math.ceil(M / BLOCK_M) * BLOCK_M
+    num_m_blocks = math.ceil(M / BLOCK_M)
+    BLOCK_HEADDIM = max(triton.next_power_of_2(D), 16)
+    num_warps = 4 if D <= 64 else 8
+
+    out = torch.empty_like(q) if write_o else q.new_empty(0)
+    lse = torch.empty((B, H, M_rounded), device=q.device, dtype=torch.float32)
+    tmp = torch.empty_like(lse)
+    partial_colsum = torch.empty((num_m_blocks, B * H, N), device=q.device, dtype=torch.float32)
+    col_sum = torch.empty((B, H, N), device=q.device, dtype=torch.float32)
+
+    grid_fused = lambda META: (triton.cdiv(M, META["BLOCK_M"]), B * H)
+
+    _fwd_lse_o_partial_colsum_kernel[grid_fused](
+        q, k, v, bias if bias is not None else torch.empty(1, device=q.device, dtype=q.dtype),
+        out, lse, tmp,
+        partial_colsum,
+        scale,
+        q.stride(0), q.stride(2), q.stride(1),
+        k.stride(0), k.stride(2), k.stride(1),
+        v.stride(0), v.stride(2), v.stride(1),
+        *b_strides,
+        out.stride(0) if write_o else 0,
+        (out.stride(2) if write_o else 0),
+        (out.stride(1) if write_o else 0),
+        partial_colsum.stride(0), partial_colsum.stride(1),
+        H, M, N, M_rounded, D,
+        bias_type, causal,
+        1 if write_o else 0,
+        BLOCK_HEADDIM,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        num_warps=num_warps, num_stages=1,
+    )
+
+    BLOCK_R = 128
+    grid_reduce = (triton.cdiv(N, BLOCK_R), B * H)
+
+    _reduce_partial_colsum_kernel[grid_reduce](
+        partial_colsum, col_sum,
+        partial_colsum.stride(0), partial_colsum.stride(1),
+        col_sum.stride(0), col_sum.stride(1), col_sum.stride(2),
+        num_m_blocks, H, N,
+        BLOCK_R=BLOCK_R,
+    )
+
+    return (out if write_o else None), lse, col_sum
+
+
+def fa_forward_colsum_fast_sub(q, k, v, bias=None, causal=False,
+                               softmax_scale=None, write_o=True,
+                               subsample_ratio=0.25):
+    """Forward + ColSum with M-subsampled colsum for faster heavy-hitter scoring.
+
+    Pass 1 (fwd): Identical to fa_forward_colsum_fast — full-M O + LSE.
+    Pass 2 (colsum): Uses only M' = floor(M * subsample_ratio) uniformly-spaced
+                     rows, then scales by M / M'.
+
+    For heavy-hitter ranking (top-K selection) the ordering is nearly identical
+    to the exact colsum, while the colsum GEMM cost drops proportionally.
+    """
+    assert q.is_cuda and q.dtype in (torch.float16, torch.bfloat16)
+    B, M, H, D = q.shape
+    N = k.shape[1]
+    assert k.shape == (B, N, H, D) and v.shape == (B, N, H, D)
+
+    scale = softmax_scale or (1.0 / math.sqrt(D))
+
+    # --- Prepare bias (same as fa_forward_colsum_fast) ---
+    bias_type = "none"
+    b_strides = (0, 0, 0)
+    if bias is not None:
+        if bias.stride(-1) != 1:
+            bias = bias.contiguous()
+        if bias.shape[2:] == (1, N):
+            bias_type = "vector"
+            bias = bias.expand(B, H, M, N)
+        elif bias.shape[2:] == (M, N):
+            bias_type = "matrix"
+        else:
+            raise RuntimeError("bias last two dims must be (1,N) or (M,N)")
+        b_strides = (bias.stride(0), bias.stride(1), bias.stride(2))
+
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_HEADDIM = max(triton.next_power_of_2(D), 16)
+
+    # ---- Pass 1: full forward (O + LSE) — unchanged ----
+    M_rounded = math.ceil(M / 128) * 128
+    out = torch.empty_like(q) if write_o else q.new_empty(0)
+    lse = torch.empty((B, H, M_rounded), device=q.device, dtype=torch.float32)
+    tmp = torch.empty_like(lse)
+
+    num_warps_a = 4 if D <= 64 else 8
+    grid_a = lambda META: (triton.cdiv(M, META["BLOCK_M"]), B * H)
+
+    _fwd_lse_o_kernel[grid_a](
+        q, k, v, bias if bias is not None else torch.empty(1, device=q.device, dtype=q.dtype),
+        out, lse, tmp,
+        scale,
+        q.stride(0), q.stride(2), q.stride(1),
+        k.stride(0), k.stride(2), k.stride(1),
+        v.stride(0), v.stride(2), v.stride(1),
+        *b_strides,
+        out.stride(0) if write_o else 0,
+        (out.stride(2) if write_o else 0),
+        (out.stride(1) if write_o else 0),
+        H, M, N, M_rounded, D,
+        bias_type, causal,
+        1 if write_o else 0,
+        BLOCK_HEADDIM,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        num_warps=num_warps_a, num_stages=1,
+    )
+
+    # ---- Subsample for colsum ----
+    M_sub = max(BLOCK_M, int(M * subsample_ratio))
+    M_sub = (M_sub // BLOCK_M) * BLOCK_M
+
+    if M_sub >= M:
+        M_sub = M
+        q_sub = q
+        lse_sub_padded = lse
+        M_sub_rounded = M_rounded
+        correction = 1.0
+    else:
+        step = M / M_sub
+        indices = (torch.arange(M_sub, device=q.device, dtype=torch.float32) * step).long()
+
+        q_sub = q[:, indices, :, :].contiguous()
+
+        lse_full = lse[:, :, :M]
+        lse_sub = lse_full[:, :, indices].contiguous()
+
+        M_sub_rounded = math.ceil(M_sub / BLOCK_M) * BLOCK_M
+        lse_sub_padded = torch.full(
+            (B, H, M_sub_rounded), float('-inf'),
+            device=q.device, dtype=torch.float32)
+        lse_sub_padded[:, :, :M_sub] = lse_sub
+        correction = M / M_sub
+
+    if bias_type == "matrix" and M_sub < M:
+        raise NotImplementedError(
+            "M-subsampling with matrix bias requires gathering the bias M dim; "
+            "use vector bias (the default in STAC).")
+
+    # ---- Pass 2: subsampled colsum ----
+    col_sum = torch.empty((B, H, N), device=q.device, dtype=torch.float32)
+    num_warps_b = 4 if D <= 64 else 8
+    grid_b = lambda META: (triton.cdiv(N, META["BLOCK_N"]), B * H)
+
+    _colsum_n_major_kernel[grid_b](
+        q_sub, k,
+        bias if bias is not None else torch.empty(1, device=q.device, dtype=q.dtype),
+        lse_sub_padded, col_sum,
+        scale,
+        q_sub.stride(0), q_sub.stride(2), q_sub.stride(1),
+        k.stride(0), k.stride(2), k.stride(1),
+        *b_strides,
+        col_sum.stride(0), col_sum.stride(1), col_sum.stride(2),
+        H, M_sub, N, M_sub_rounded, D,
+        bias_type, causal,
+        BLOCK_HEADDIM,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        num_warps=num_warps_b, num_stages=2,
+    )
+
+    if correction != 1.0:
+        col_sum *= correction
+
+    return (out if write_o else None), lse, col_sum
+
+
+# =========================================================================
+# Self-test: accuracy + efficiency
+# =========================================================================
+if __name__ == "__main__":
+    import time
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    def reference_attention(q, k, v, bias=None, softmax_scale=None):
+        B, M, H, D = q.shape
+        N = k.shape[1]
+        if softmax_scale is None:
+            softmax_scale = D ** (-0.5)
+        q_t = q.transpose(1, 2).float()
+        k_t = k.transpose(1, 2).float()
+        v_t = v.transpose(1, 2).float()
+        scores = torch.matmul(q_t, k_t.transpose(-2, -1)) * softmax_scale
+        if bias is not None:
+            b = bias.float()
+            if b.dim() == 4:
+                b = b.squeeze(2)
+            scores = scores + b.unsqueeze(2)
+        lse = torch.logsumexp(scores, dim=-1)
+        attn = torch.softmax(scores, dim=-1)
+        col_sum = attn.sum(dim=2)
+        out = torch.matmul(attn, v_t)
+        return out.transpose(1, 2), lse, col_sum
+
+    def bench(fn, M, N, warmup=10, repeat=100):
+        if M * N >= 8 * 1024 * 1024:
+            repeat = min(repeat, 20)
+            warmup = min(warmup, 3)
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(repeat):
+            fn()
+        torch.cuda.synchronize()
+        return (time.perf_counter() - t0) / repeat
+
+    configs = [
+        (1, 1024, 16384, 16, 64, "bias_inf"),
+        (1, 1024, 16384, 16, 64, "none"),
+        (1, 4096, 16384, 16, 64, "bias_inf"),
+        (1, 4096, 16384, 16, 64, "none"),
+        (1, 1024, 2048,  16, 64, "bias_inf"),
+        (1, 1024, 2048,  16, 64, "none"),
+    ]
+
+    print(f"GPU: {torch.cuda.get_device_name()}")
+    print()
+
+    # ---- Accuracy ----
+    print("=" * 110)
+    print("Accuracy (max abs error vs PyTorch fp32 reference)")
+    print("=" * 110)
+    hdr = (f"{'Config':>36s} {'Bias':>10s} | "
+           f"{'fast O':>8s} {'fast LSE':>8s} {'fast CS':>8s} | "
+           f"{'beta O':>8s} {'beta LSE':>8s} {'beta CS':>8s}")
+    print(hdr)
+    print("-" * 110)
+
+    for B, M, N, H, D, bias_mode in configs:
+        dtype = torch.float16
+        q = torch.randn(B, M, H, D, device=device, dtype=dtype)
+        k = torch.randn(B, N, H, D, device=device, dtype=dtype)
+        v = torch.randn(B, N, H, D, device=device, dtype=dtype)
+
+        if bias_mode == "bias_inf":
+            bias_4d = torch.zeros(1, H, 1, N, device=device, dtype=torch.float32)
+            bias_4d[:, :, :, 3 * N // 4:] = float("-inf")
+        else:
+            bias_4d = None
+
+        scale = D ** (-0.5)
+        ref_o, ref_lse, ref_cs = reference_attention(q, k, v, bias=bias_4d, softmax_scale=scale)
+
+        out_f, lse_f, cs_f = fa_forward_colsum_fast(q, k, v, bias=bias_4d, softmax_scale=scale, write_o=True)
+        out_b, lse_b, cs_b = fa_forward_colsum_fast_beta(q, k, v, bias=bias_4d, softmax_scale=scale, write_o=True)
+
+        lse_f_v = lse_f[:, :, :M].contiguous()
+        lse_b_v = lse_b[:, :, :M].contiguous()
+
+        fo = (out_f.float() - ref_o).abs().max().item()
+        fl = (lse_f_v - ref_lse).abs().max().item()
+        fc = (cs_f - ref_cs).abs().max().item()
+        bo = (out_b.float() - ref_o).abs().max().item()
+        bl = (lse_b_v - ref_lse).abs().max().item()
+        bc = (cs_b - ref_cs).abs().max().item()
+
+        tag = f"B={B} M={M} N={N} H={H}"
+        print(f"{tag:>36s} {bias_mode:>10s} | "
+              f"{fo:8.6f} {fl:8.6f} {fc:8.6f} | "
+              f"{bo:8.6f} {bl:8.6f} {bc:8.6f}")
+
+    # ---- Efficiency ----
+    print()
+    print("=" * 110)
+    print("Efficiency (ms, lower is better)")
+    print("=" * 110)
+    hdr2 = (f"{'Config':>36s} {'Bias':>10s} | "
+            f"{'fast(ms)':>10s} {'beta(ms)':>10s} {'speedup':>8s}")
+    print(hdr2)
+    print("-" * 110)
+
+    for B, M, N, H, D, bias_mode in configs:
+        dtype = torch.float16
+        q = torch.randn(B, M, H, D, device=device, dtype=dtype)
+        k = torch.randn(B, N, H, D, device=device, dtype=dtype)
+        v = torch.randn(B, N, H, D, device=device, dtype=dtype)
+
+        if bias_mode == "bias_inf":
+            bias_4d = torch.zeros(1, H, 1, N, device=device, dtype=torch.float32)
+            bias_4d[:, :, :, 3 * N // 4:] = float("-inf")
+        else:
+            bias_4d = None
+
+        t_fast = bench(
+            lambda: fa_forward_colsum_fast(q, k, v, bias=bias_4d, write_o=True),
+            M, N,
+        )
+        t_beta = bench(
+            lambda: fa_forward_colsum_fast_beta(q, k, v, bias=bias_4d, write_o=True),
+            M, N,
+        )
+        speedup = t_fast / t_beta if t_beta > 0 else float("inf")
+
+        tag = f"B={B} M={M} N={N} H={H}"
+        print(f"{tag:>36s} {bias_mode:>10s} | "
+              f"{t_fast*1000:10.3f} {t_beta*1000:10.3f} {speedup:7.2f}x")
+
+    print()
+    print("speedup > 1 means beta is faster than fast")

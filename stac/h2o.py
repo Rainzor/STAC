@@ -7,7 +7,8 @@ import torch.nn.functional as F
 import numpy as np
 import warnings
 from .kv_manager import KVManager
-from .flash_attn_triton import fa_forward_colsum_fast
+
+from .flash_attn_triton import fa_forward_colsum_fast, fa_forward_colsum_fast_sub
 
 logger = logging.getLogger(__name__)
 
@@ -27,10 +28,12 @@ class HeavyHittersKV(KVManager):
                  *args,
                  hh_size: int = 0,            # heavy-hitter "frame-equivalent" count -> converted to tokens
                  temperature: float = 1.0,
+                 subsample_ratio: float = 1.0,
                  **kwargs
                  ):
         super().__init__(*args,
                          **kwargs)
+        self.subsample_ratio = float(subsample_ratio)
 
         # Metadata Update
         self.hh_size = int(hh_size)
@@ -135,10 +138,9 @@ class HeavyHittersKV(KVManager):
         assert q.dtype in (torch.float16, torch.bfloat16), "q must be fp16/bf16"
         assert k.dtype in (torch.float16, torch.bfloat16) and v.dtype in (torch.float16, torch.bfloat16)
 
-        out, _, col_sum = fa_forward_colsum_fast(
-                q, k, v,
-                write_o=True
-                )
+        out, _, col_sum = fa_forward_colsum_fast_sub(
+            q, k, v, write_o=True,
+            subsample_ratio=getattr(self, 'subsample_ratio', 1.0))
         scores = col_sum.unsqueeze(2) #[B, H, 1, T]
 
         self._last_query_offset[slot_idx] = Tq

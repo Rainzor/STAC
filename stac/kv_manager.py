@@ -9,8 +9,6 @@ from typing import List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
-from .flash_attn_triton import fa_forward_colsum_fast
-
 
 class KVManager:
     """

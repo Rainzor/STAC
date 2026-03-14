@@ -1,17 +1,20 @@
 # Copyright (c) 2025 STAC Authors. All rights reserved.
 
 import logging
-from typing import List, Optional, Tuple, Dict, Callable
 import os
+from typing import List, Optional, Tuple, Dict, Callable
 import torch
 import warnings
 import numpy as np
 from .h2o import HeavyHittersKV
-from .flash_attn_triton import fa_forward_colsum_fast
 from .voxel import BinaryVoxel
+from .flash_attn_triton import fa_forward_colsum_fast, fa_forward_colsum_fast_sub
+
 from .merger import VoxelKVMerger, _MEM_PROFILE, _gpu_mem_mb, _tensor_mb
 
 logger = logging.getLogger(__name__)
+
+_SUBSAMPLE = float(os.environ.get("SUBSAMPLE", "1.0"))
 
 
 class STACVoxelKV(HeavyHittersKV):
@@ -129,9 +132,12 @@ class STACVoxelKV(HeavyHittersKV):
             self._vk_conf["score_thresh"],
         )
         logger.info(
-            "  pool: allocator=%s  growth=%d  cap=%d  seg=%d%s",
-            self._vk_conf["allocator"], self._vk_conf["slab_growth"],
-            self._vk_conf["slab_cap"], self._vk_conf["seg_size"],
+            "  pool: backend=%s allocator=%s  growth=%d  cap=%d  seg=%d%s",
+            self._vk_conf["backend"],
+            self._vk_conf["allocator"], 
+            self._vk_conf["slab_growth"],
+            self._vk_conf["slab_cap"], 
+            self._vk_conf["seg_size"],
             getattr(self, "_stac_cpu_offload_str", ""),
         )
 
@@ -235,11 +241,9 @@ class STACVoxelKV(HeavyHittersKV):
         V_all = V_all.unsqueeze(0).transpose(1, 2).contiguous()
         q = query_states.contiguous()
 
-        # Triton FlashAttn (col-sum)
-        # out, _, col_sum = fa_forward_colsum(q, K_all, V_all, bias=bias, write_o=True)
-        out, _, col_sum = fa_forward_colsum_fast(q, K_all, V_all, bias=bias, write_o=True)
-
-        # out, _, col_sum = fa_forward_scoresum(q, K_all, V_all, bias=bias, write_o=True)
+        out, _, col_sum = fa_forward_colsum_fast_sub(
+            q, K_all, V_all, bias=bias, write_o=True,
+            subsample_ratio=_SUBSAMPLE)
         scores_total = col_sum.unsqueeze(2)  # [B, H, 1, T_total]
 
         # update hot scores (merge scores cached separately for diagnostics)

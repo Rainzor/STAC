@@ -226,8 +226,8 @@ def run(images, model, dtype, device, args):
     return predictions, out
 
 def main(args):
-    if args.size == 518: # 640x480 -> 518x392, patch size=14
-        resolution = (518, 392)
+    if args.size == 518:  # keep (518, 336) aligned with SparseVGGT for same token count / memory
+        resolution = (518, 336)
     elif args.size == 512:
         resolution = (512, 384)
     elif args.size == 224:

@@ -25,5 +25,5 @@ for DATASET in "${DATASETS[@]}"; do
         --dataset_type "${DATASET}" \
         --save_tag "baseline" \
         --vis_tag "causal" \
-        --mode "window_kv" --streaming -win -1 \
-done
+        --mode "window_kv" --streaming -win -1
+    done

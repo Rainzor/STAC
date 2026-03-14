@@ -93,6 +93,7 @@ class VoxelKVMerger:
         self.dtype = dtype
         self.device = device
         self.debug = kwargs.get("debug", False)
+        self.use_seed = kwargs.get("use_seed", False)
         self.backend = backend
         init_voxels = max(1, int(init_voxels))
         self._voxel_alloc = init_voxels
@@ -102,7 +103,7 @@ class VoxelKVMerger:
         # ---- PIVOT POOL (merged tokens) ----
         self.piv_cap = int(pivot_cap)
         piv_fields_specs = {"K": "vector", "V": "vector", "W": "scalar", "S": "scalar", "C": "scalar"}
-        seed_fields_specs = {"K_seed": "vector", "S_seed": "scalar"}
+        seed_fields_specs = {"K_seed": "vector", "S_seed": "scalar"} if self.use_seed else {}
         # Use a single allocator type for both pivots and buffer
         self._alloc_type = kwargs.get("allocator", "slab")  # also drives CUDA seg_mode
 
@@ -490,8 +491,12 @@ class VoxelKVMerger:
         Sp = oldPack["S"]         # [G,P]
         Cp = oldPack["C"]         # [G,P]
         Mp = oldPack["M"]         # [G,P] bool
-        Kpseed = oldPack["K_seed"]  # [G,P,D] normalized seed keys
-        Spseed = oldPack["S_seed"]  # [G,P]
+        if self.use_seed:
+            Kpseed = oldPack["K_seed"]  # [G,P,D] normalized seed keys
+            Spseed = oldPack["S_seed"]  # [G,P]
+        else:
+            Kpseed = F.normalize(Kp, dim=-1, eps=1e-6)
+            Spseed = Sp.clone()
 
         device = Kp.device
         P = Kp.size(1)
@@ -565,12 +570,15 @@ class VoxelKVMerger:
 
 
         # 11) Write back
-        Kpseed[arange_g, write_idx, :] = Pack_new["K_seed"]
-        Spseed[arange_g, write_idx] = Pack_new["S_seed"]
+        if self.use_seed:
+            Kpseed[arange_g, write_idx, :] = Pack_new["K_seed"]
+            Spseed[arange_g, write_idx] = Pack_new["S_seed"]
         data = {
             "K": Kp, "V": Vp, "W": Wp, "S": Sp, "C": Cp, "M": Mp,
-            "K_seed": Kpseed.to(self.dtype), "S_seed": Spseed,
         }
+        if self.use_seed:
+            data["K_seed"] = Kpseed.to(self.dtype)
+            data["S_seed"] = Spseed
         self.pivots.write_rows_dict(rows, data)
 
 
@@ -627,9 +635,13 @@ class VoxelKVMerger:
         Cp = pack["C"].float()      # [G, P]
         Mp = pack["M"].clone()      # [G, P] bool
         
-        # Seed keys for similarity (normalized)
-        Kp_seed = pack["K_seed"].float()  # [G, P, D]
-        Sp_seed = pack["S_seed"].float()  # [G, P]
+        # Seed keys for similarity: from stored seeds when use_seed, else derive from pivot K/S
+        if self.use_seed:
+            Kp_seed = pack["K_seed"].float()  # [G, P, D]
+            Sp_seed = pack["S_seed"].float()  # [G, P]
+        else:
+            Kp_seed = F.normalize(Kp, dim=-1, eps=1e-6)
+            Sp_seed = Sp.clone()
         
         G, P, D = Kp.shape
         
@@ -696,29 +708,38 @@ class VoxelKVMerger:
                 "M": Mp,
             }
             
-            # Update seeds when new tokens have higher scores
-            if update_seed:
+            # Update seeds when new tokens have higher scores (per-pivot); only when use_seed
+            if self.use_seed and update_seed:
                 ids_merge = merge_mask.nonzero(as_tuple=False).squeeze(1)
-                rows_merge = inv_rows[ids_merge]  # [M]
-                scores_merge = S_tok.index_select(0, ids_merge)  # [M]
-                uniq_g, inv_g = torch.unique(rows_merge, sorted=True, return_inverse=True)
-                max_scores = torch.full((uniq_g.numel(),), float('-inf'), device=device)
-                max_scores = max_scores.scatter_reduce(0, inv_g, scores_merge, reduce='amax', include_self=True)
-                is_seed = (scores_merge == max_scores.index_select(0, inv_g))
+                rows_merge = inv_rows[ids_merge]                    # [M] group indices
+                pivots_merge = assign[ids_merge].to(torch.long)    # [M] pivot indices
+                scores_merge = S_tok.index_select(0, ids_merge)    # [M]
+
+                # Group by (group, pivot) pair to handle P>1
+                gp_key = rows_merge * P + pivots_merge             # [M]
+                uniq_gp, inv_gp = torch.unique(gp_key, sorted=True, return_inverse=True)
+                max_scores = torch.full((uniq_gp.numel(),), float('-inf'), device=device)
+                max_scores = max_scores.scatter_reduce(0, inv_gp, scores_merge, reduce='amax', include_self=True)
+                is_seed = (scores_merge == max_scores.index_select(0, inv_gp))
                 big = torch.full_like(ids_merge, ids_merge.numel())
                 ids_masked = torch.where(is_seed, ids_merge, big)
-                first_pos = torch.full((uniq_g.numel(),), ids_merge.numel(), device=device, dtype=torch.long)
-                first_pos = first_pos.scatter_reduce(0, inv_g, ids_masked, reduce='amin', include_self=True)
+                first_pos = torch.full((uniq_gp.numel(),), ids_merge.numel(), device=device, dtype=torch.long)
+                first_pos = first_pos.scatter_reduce(0, inv_gp, ids_masked, reduce='amin', include_self=True)
                 seed_pos = first_pos.clamp_max(ids_merge.numel() - 1)
-                Kp_seed_update = K_tok.index_select(0, seed_pos)
-                Sp_seed_update = S_tok.index_select(0, seed_pos)
-                mask = Sp_seed_update > Sp_seed.index_select(0, uniq_g)
+                Kp_seed_update = K_tok.index_select(0, seed_pos)   # [U, D]
+                Sp_seed_update = S_tok.index_select(0, seed_pos)   # [U]
+
+                gp_g = uniq_gp // P  # group indices
+                gp_p = uniq_gp % P   # pivot indices
+                mask = Sp_seed_update > Sp_seed[gp_g, gp_p]       # [U] 1-D comparison
                 if mask.any():
-                    uniq_g_upd = uniq_g[mask]
-                    Kp_seed.index_copy_(0, uniq_g_upd, F.normalize(Kp_seed_update[mask], dim=-1, eps=1e-6))
-                    Sp_seed.index_copy_(0, uniq_g_upd, Sp_seed_update[mask])
-            pack_piv_update["K_seed"] = Kp_seed.to(self.dtype)
-            pack_piv_update["S_seed"] = Sp_seed
+                    upd_g = gp_g[mask]
+                    upd_p = gp_p[mask]
+                    Kp_seed[upd_g, upd_p] = F.normalize(Kp_seed_update[mask], dim=-1, eps=1e-6)
+                    Sp_seed[upd_g, upd_p] = Sp_seed_update[mask]
+            if self.use_seed:
+                pack_piv_update["K_seed"] = Kp_seed.to(self.dtype)
+                pack_piv_update["S_seed"] = Sp_seed
             
             # Write updated pivots back
             self.pivots.write_rows_dict(uniq_rows, pack_piv_update)
