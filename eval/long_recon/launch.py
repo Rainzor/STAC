@@ -221,7 +221,7 @@ def run(images, model, dtype, device, args):
     if "timing" in predictions:
         out["Time(ms)"] = predictions["timing"]
     if "merger" in predictions and predictions["merger"]:
-        out["VoxelCache"] = _to_json_serializable(predictions["merger"])
+        out["Merger"] = _to_json_serializable(predictions["merger"])
     torch.cuda.empty_cache()
     return predictions, out
 

@@ -29,7 +29,7 @@ class KVManager:
                  head_dim: int,
                  token_per_frame: int,
                  register_layers: Optional[List[int]] = None, 
-                 chunk_size: int = 1,        # unused
+                 chunk_size: int = 1,        # frames per step; used for buffer sizing and chunk_token_size
                  buffer_size: int = 8,  
                  recent_size: int = 1,        # recent "frame-equivalent" count -> converted to tokens
                  pinned_idx: Optional[List[int]] = None,  # frame indices to always pin (entire frames)
@@ -68,7 +68,7 @@ class KVManager:
         self.cache_size = self.recent_size
         pinned_idx = torch.tensor(pinned_idx or [], dtype=torch.long)
         self.pinned_size = len(pinned_idx)
-        self.chunk_size = int(chunk_size)  # unused
+        self.chunk_size = int(chunk_size)
         self.hot_size = self.cache_size + self.pinned_size
         if self.reserved_buffer_size < self.hot_size + self.chunk_size:
             warnings.warn(f"Warning: buffer_size {self.reserved_buffer_size} is smaller than hh_size+recent_size+pinned ({self.hot_size}). This may lead to no pruning.")

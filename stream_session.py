@@ -278,29 +278,39 @@ class StreamSession:
         if mode in ["window_kv","causal"]:
             # Use H2O attention to maintain a heavy-hitter + recent KV cache for the aggregator.
             window_size = kwargs.get("window_size", 0)
+            chunk_size = kwargs.get("chunk_size", 1)
             if mode == "causal":
                 window_size = num_frames
             if window_size < 0:
                 logger.warning("Switching to causal attention mode.")
                 window_size = num_frames  # effectively causal
+            if chunk_size < 1:
+                raise ValueError(f"chunk_size must be >= 1, got {chunk_size}.")
+            if window_size > 0 and chunk_size > window_size:
+                logger.warning(
+                    f"chunk_size ({chunk_size}) > window_size ({window_size}): "
+                    "prune may trigger every chunk."
+                )
             kv_kwargs = deepcopy(kwargs)
             kv_kwargs.update({
                 "register_layers": None,
                 "window_size": window_size,
+                "chunk_size": chunk_size,
             })
             kv_kwargs = self.register_kv_mgr(mode, images, KVManager, **kv_kwargs)
             self.model.set_camhead(self.cam_cache_update)
             debug_timing = kwargs.get("timing", True)
             progress, task = _make_progress("Window Mode", num_frames)
             with Live(progress, console=_console, refresh_per_second=8) as live:
-                for i in range(num_frames):
-                    image = images[i : i + 1].to(device=self.device)
+                for frame_idx in range(0, num_frames, chunk_size):
+                    frame_buffer = images[frame_idx : min(frame_idx + chunk_size, num_frames)].to(device=self.device)
+                    frame_buffer_size = frame_buffer.shape[0]
                     outputs = self.model(
-                        images=image,
+                        images=frame_buffer,
                         mode="full",
                         camera_head_kv_cache_list=None,
                         streaming=True,
-                        is_anchor_exist=i==0,
+                        is_anchor_exist=frame_idx == 0,
                         timing=debug_timing,
                     )
                     timing = outputs.get("timing", {})
@@ -324,11 +334,11 @@ class StreamSession:
                     else:
                         cache_str = f"tokens={kvcache_size}  mem={kvcache_mem:.0f}MB"
 
-                    agg_time = timing.get("aggregator_infer_time", 0)
-                    prune_time = timing.get("kv_pruning_time", 0)
+                    agg_time = timing.get("aggregator_infer_time", 0) / frame_buffer_size
+                    prune_time = timing.get("kv_pruning_time", 0) / frame_buffer_size
                     allocated, reserved = _gpu_mem_mb()
 
-                    progress.update(task, advance=1)
+                    progress.update(task, advance=frame_buffer_size)
                     live.update(Group(
                         progress,
                         _stats_table([
@@ -337,14 +347,13 @@ class StreamSession:
                             ("GPU(MB)", f"alloc={allocated:.0f}  reserved={reserved:.0f}"),
                         ]),
                     ))
-                    self._processed_frames += 1
+                    self._processed_frames += frame_buffer_size
             if VERBOSE:
                 logger.info("Window mode done.")
-            # Persist Token + Memory(MB) for eval/compare (same shape as window_chunk_merge)
+            # Token stats are not meaningful for our kv_manager; keep Token empty. Persist Memory(MB) for eval/compare.
             kv_mgr = self.model.aggregator.kv_manager
             if kv_mgr is not None:
-                kvcache_info = self.model.aggregator.get_kv_mgr_info()
-                metrics = {"Token": {0: kvcache_info}}
+                metrics = {"Token": {}}
                 if hasattr(kv_mgr, "get_memory_details"):
                     metrics["Memory(MB)"] = kv_mgr.get_memory_details()
                 self.stats = metrics
@@ -509,14 +518,10 @@ class StreamSession:
             if VERBOSE:
                 logger.info("STAC chunk-merge mode done.")
 
-            voxel_merge_stats = {}
+            # Token stats are not meaningful for our kv_manager; keep Token empty. Persist Memory(MB) for eval/compare.
             kv_mgr = self.model.aggregator.kv_manager
-            if hasattr(kv_mgr, "get_merger_info"):
-                merge_info = self.model.aggregator.kv_manager.get_merger_info()
-                voxel_merge_stats[0] = merge_info
-                metrics = {}
-                metrics["hyperparameters"] = merger_kwargs
-                metrics["Token"] = voxel_merge_stats
+            if kv_mgr is not None:
+                metrics = {"hyperparameters": merger_kwargs, "Token": {}}
                 if hasattr(kv_mgr, "get_memory_details"):
                     metrics["Memory(MB)"] = kv_mgr.get_memory_details()
                 self.stats = metrics

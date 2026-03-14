@@ -164,8 +164,8 @@ def _get_timing(entry: dict) -> dict | None:
 
 
 def _get_memory(entry: dict) -> dict | None:
-    """Get memory_details dict from a scene entry (supports VoxelCache/Memory(MB) or merger/memory_details)."""
-    vc = entry.get("VoxelCache") or entry.get("merger") or {}
+    """Get memory_details dict from a scene entry (supports Merger/Memory(MB) or merger/memory_details)."""
+    vc = entry.get("Merger") or entry.get("merger") or {}
     return vc.get("Memory(MB)") or vc.get("memory_details")
 
 
