@@ -257,7 +257,7 @@ def _depth_metric(depth_metrics, *candidate_keys):
     return float("nan")
 
 def main(args):
-    if args.size == 518:  # keep (518, 392) aligned with SparseVGGT for same token count / memory
+    if args.size == 518:  # keep (518, 392) aligned with STream3R
         resolution = (518, 392)
     elif args.size == 512:
         resolution = (512, 384)

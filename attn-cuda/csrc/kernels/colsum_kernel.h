@@ -93,7 +93,6 @@ colsum_n_major_kernel(StacFlashParams params)
 
     GmemTiledCopy gmem_tiled_copy;
     auto gmem_thr_copy = gmem_tiled_copy.get_thread_slice(thread_idx);
-    auto gmem_thr0_copy = gmem_tiled_copy.get_thread_slice(_0{});
 
     // --- Load K tile to smem (once) ---
     {
@@ -171,7 +170,6 @@ colsum_n_major_kernel(StacFlashParams params)
 
     // Q load predicates
     Tensor cQ_id = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
-    Tensor t0QcQ = gmem_thr0_copy.partition_S(cQ_id);
     Tensor tQcQ = gmem_thr_copy.partition_S(cQ_id);
     Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(gmem_thr_copy.partition_D(sQ))));
     #pragma unroll
@@ -184,13 +182,30 @@ colsum_n_major_kernel(StacFlashParams params)
         Tensor tQgQ = gmem_thr_copy.partition_S(gQ);
         Tensor tQsQ = gmem_thr_copy.partition_D(sQ);
         int const q_row_limit = seqlen_q_eff - mi * kBlockM;
+        bool const even_q = (seqlen_q_eff % kBlockM) == 0;
+        bool const is_q_tail_block = (!even_q) && (mi == (m_block_max - 1));
         #pragma unroll
         for (int r = 0; r < size<1>(tQgQ); ++r) {
-            bool pred_r = get<0>(t0QcQ(_0{}, r, _0{})) < q_row_limit;
+            bool pred_r = get<0>(tQcQ(_0{}, r, _0{})) < q_row_limit;
             #pragma unroll
             for (int d = 0; d < size<2>(tQgQ); ++d) {
-                cute::copy(gmem_tiled_copy.with(pred_r && tQpQ(d)),
-                           tQgQ(_, r, d, mi), tQsQ(_, r, d));
+                if (!is_q_tail_block) {
+                    cute::copy(gmem_tiled_copy.with(pred_r && tQpQ(d)),
+                               tQgQ(_, r, d, mi), tQsQ(_, r, d));
+                } else {
+                    // Tail-safe path for Q in colsum kernel.
+                    bool pred_all = pred_r && tQpQ(d);
+                    #pragma unroll
+                    for (int v = 0; v < size<0>(tQcQ); ++v) {
+                        pred_all = pred_all && (get<0>(tQcQ(v, r, d)) < q_row_limit);
+                    }
+                    if (pred_all) {
+                        cute::copy(gmem_tiled_copy.with(true),
+                                   tQgQ(_, r, d, mi), tQsQ(_, r, d));
+                    } else {
+                        cute::fill(tQsQ(_, r, d), Element(0));
+                    }
+                }
             }
         }
     };

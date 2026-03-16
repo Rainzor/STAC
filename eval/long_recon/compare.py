@@ -10,6 +10,7 @@ Usage: python compare.py [--dir DIR] [--tag TAG] [--metrics ...] [--scene NAME] 
 """
 import argparse
 import json
+import re
 from pathlib import Path
 
 # Metric groups: (display_name, mean_key, median_key). Keys can be str or tuple of two keys for (k1+k2)/2.
@@ -53,31 +54,23 @@ MODE_ABBREV = {
 }
 
 
+# Tag = part between "overall_metrics_" and trailing "_YYYYMMDD_HHMM" (e.g. overall_metrics_stac_cuda_samp_25_20260314_2216 -> stac_cuda_samp_25)
+_TIMESTAMP_SUFFIX_RE = re.compile(r"_\d{8}_\d{4}$")
+
+
 def short_name(filename: str) -> str:
-    """Strip path, date suffix and .json to get a compact run label."""
-    stem = Path(filename).stem  # e.g. overall_metrics_w4h2r2c4_20260310_2230
-    parts = stem.split("_")
-    cleaned = []
-    for p in parts:
-        if p in ("overall", "metrics"):
-            continue
-        if len(p) == 8 and p.isdigit():
-            break
-        cleaned.append(p)
-    return "_".join(cleaned) if cleaned else stem
+    """Strip path, overall_metrics prefix, time suffix and .json to get the tag as run label."""
+    return tag_from_filename(filename) or Path(filename).stem
 
 
 def tag_from_filename(filename: str) -> str:
-    """Extract tag from filename: first segment after overall/metrics (e.g. overall_metrics_stac_w4_... -> 'stac')."""
+    """Extract tag from filename: text between 'overall_metrics_' and '_YYYYMMDD_HHMM' (e.g. overall_metrics_stac_cuda_samp_25_20260314_2216 -> 'stac_cuda_samp_25')."""
     stem = Path(filename).stem
-    parts = stem.split("_")
-    for p in parts:
-        if p in ("overall", "metrics"):
-            continue
-        if len(p) == 8 and p.isdigit():
-            break
-        return p
-    return ""
+    if not stem.startswith("overall_metrics_"):
+        return ""
+    mid = stem[len("overall_metrics_"):]
+    mid = _TIMESTAMP_SUFFIX_RE.sub("", mid)
+    return mid.strip("_") if mid else ""
 
 
 def config_signature(model: dict, filename_tag: str) -> tuple:
@@ -129,7 +122,7 @@ def load_files(directory: str, label_from: str = "config", tag: str | None = Non
     # Same (tag + CONFIG_LABEL_KEYS) → keep only the file with latest clock
     by_config = {}
     for f, data, model, filename_tag, sig, clock in candidates:
-        if sig not in by_config or clock > by_config[sig][1]:
+        if sig not in by_config or clock > by_config[sig][4]:
             by_config[sig] = (f, data, model, filename_tag, clock)
 
     runs = {}

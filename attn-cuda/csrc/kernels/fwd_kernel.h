@@ -147,7 +147,6 @@ fwd_bias_colsum_kernel(StacFlashParams params)
 
     GmemTiledCopy gmem_tiled_copy;
     auto gmem_thr_copy = gmem_tiled_copy.get_thread_slice(thread_idx);
-    auto gmem_thr0_copy = gmem_tiled_copy.get_thread_slice(_0{});
 
     Tensor tQgQ = gmem_thr_copy.partition_S(gQ);
     Tensor tQsQ = gmem_thr_copy.partition_D(sQ);
@@ -158,7 +157,6 @@ fwd_bias_colsum_kernel(StacFlashParams params)
 
     // Predicates for Q rows
     Tensor cQ = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
-    Tensor t0QcQ = gmem_thr0_copy.partition_S(cQ);
     Tensor tQcQ = gmem_thr_copy.partition_S(cQ);
     Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
     #pragma unroll
@@ -166,7 +164,6 @@ fwd_bias_colsum_kernel(StacFlashParams params)
 
     // Predicates for KV rows
     Tensor cKV = cute::make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDim>>{});
-    Tensor t0KVcKV = gmem_thr0_copy.partition_S(cKV);
     Tensor tKVcKV = gmem_thr_copy.partition_S(cKV);
     Tensor tKVpKV = make_tensor<bool>(make_shape(size<2>(tVsV)));
     #pragma unroll
@@ -175,12 +172,31 @@ fwd_bias_colsum_kernel(StacFlashParams params)
     // Load Q to smem
     {
         int const q_row_limit = seqlen_q - m_block * kBlockM;
+        bool const even_q = (seqlen_q % kBlockM) == 0;
+        int const q_block_max = (seqlen_q + kBlockM - 1) / kBlockM;
+        bool const is_q_tail_block = (!even_q) && (m_block == (q_block_max - 1));
         #pragma unroll
         for (int m = 0; m < size<1>(tQgQ); ++m) {
-            bool pred_m = get<0>(t0QcQ(_0{}, m, _0{})) < q_row_limit;
+            bool pred_m = get<0>(tQcQ(_0{}, m, _0{})) < q_row_limit;
             #pragma unroll
             for (int k = 0; k < size<2>(tQgQ); ++k) {
-                cute::copy(gmem_tiled_copy.with(pred_m && tQpQ(k)), tQgQ(_, m, k), tQsQ(_, m, k));
+                if (!is_q_tail_block) {
+                    cute::copy(gmem_tiled_copy.with(pred_m && tQpQ(k)),
+                               tQgQ(_, m, k), tQsQ(_, m, k));
+                } else {
+                    // Tail-safe path for Q: require all lanes in the copy atom in-bounds.
+                    bool pred_all = pred_m && tQpQ(k);
+                    #pragma unroll
+                    for (int v = 0; v < size<0>(tQcQ); ++v) {
+                        pred_all = pred_all && (get<0>(tQcQ(v, m, k)) < q_row_limit);
+                    }
+                    if (pred_all) {
+                        cute::copy(gmem_tiled_copy.with(true),
+                                   tQgQ(_, m, k), tQsQ(_, m, k));
+                    } else {
+                        cute::fill(tQsQ(_, m, k), Element(0));
+                    }
+                }
             }
         }
     }
