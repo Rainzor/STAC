@@ -16,14 +16,15 @@ import json
 
 from torch.utils.data._utils.collate import default_collate
 from tqdm import tqdm
+from scipy.spatial.transform import Rotation
 
-from causalvggt.utils.geometry import unproject_depth_map_to_point_map, inv
+from causalvggt.utils.geometry import unproject_depth_map_to_point_map
 from causalvggt.utils.pose_enc import pose_encoding_to_extri_intri
 from causalvggt.utils.helper import ImgNorm2Unit as ImgDust3r2Stream3r
 
 from model_wrapper import load_model, run_model
 from eval.long_recon.data import SevenScenes, NRGBD, DTU
-from eval.long_recon.eval_utils import eval_scene
+from eval.long_recon.eval_utils import eval_scene, eval_depth, eval_traj
 
 
 def _to_json_serializable(obj):
@@ -117,6 +118,19 @@ def get_args_parser():
     # eval
     parser.add_argument("--eval_cpu", action="store_true",
                         help="Evaluate on CPU (default: CUDA)")
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "fp16", "bf16"],
+        help="Autocast dtype. auto=bf16 on Ampere+ else fp16",
+    )
+    parser.add_argument("--eval_depth", action="store_true",
+                        help="Evaluate depth map metrics (print only)")
+    parser.add_argument("--eval_cam", action="store_true",
+                        help="Evaluate camera trajectory metrics (print only)")
+    parser.add_argument("--no_recon", action="store_true",
+                        help="Disable reconstruction evaluation")
     return parser
 
 
@@ -180,7 +194,6 @@ def run(images, model, dtype, device, args):
     )
     predictions["extrinsic"] = extrinsic
     predictions["intrinsic"] = intrinsic
-
     for key in predictions.keys():
         if isinstance(predictions[key], torch.Tensor):
             predictions[key] = predictions[key].cpu().numpy().squeeze(0)
@@ -224,6 +237,24 @@ def run(images, model, dtype, device, args):
         out["Merger"] = _to_json_serializable(predictions["merger"])
     torch.cuda.empty_cache()
     return predictions, out
+
+
+def _poses_to_tum_traj(poses_c2w):
+    """Convert Nx4x4 camera-to-world poses to [xyz+qwqxqyqz, timestamps]."""
+    xyz = poses_c2w[:, :3, 3]
+    quat_xyzw = Rotation.from_matrix(poses_c2w[:, :3, :3]).as_quat()
+    quat_wxyz = quat_xyzw[:, [3, 0, 1, 2]]
+    traj = np.concatenate([xyz, quat_wxyz], axis=1).astype(np.float64)
+    timestamps = np.arange(traj.shape[0], dtype=np.float64)
+    return [traj, timestamps]
+
+
+def _depth_metric(depth_metrics, *candidate_keys):
+    """Read depth metric with backward-compatible key aliases."""
+    for key in candidate_keys:
+        if key in depth_metrics:
+            return depth_metrics[key]
+    return float("nan")
 
 def main(args):
     if args.size == 518:  # keep (518, 392) aligned with SparseVGGT for same token count / memory
@@ -274,7 +305,13 @@ def main(args):
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     assert device == "cuda", "Evaluation currently only supports CUDA device"
-    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    if args.dtype == "bf16":
+        dtype = torch.bfloat16
+    elif args.dtype == "fp16":
+        dtype = torch.float16
+    else:
+        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    logger.info("Using autocast dtype: %s", str(dtype).replace("torch.", ""))
 
     model = load_model(args.model_name, args.base_model, device)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -317,22 +354,98 @@ def main(args):
             basic_metrics.update(model_metrics)
 
             # Reconstruction evaluation (GPU pointmap from depth)
-            logger.info("📌 Evaluating Reconstruction")
-            metrics_data = eval_scene(batch, predictions, args.dataset_type,
-                                      save_dir=save_dir, revisit=1, use_gpu=not args.eval_cpu)
-            basic_metrics["reconstruction"] = metrics_data
+            if not args.no_recon:
+                logger.info("📌 Evaluating Reconstruction")
+                metrics_data = eval_scene(batch, predictions, args.dataset_type,
+                                          save_dir=save_dir, revisit=1, use_gpu=not args.eval_cpu)
+                basic_metrics["reconstruction"] = metrics_data
 
-            # Save per-scene metrics
-            metrics_dir = osp.join(save_dir, "metrics")
-            os.makedirs(metrics_dir, exist_ok=True)
-            metrics_file = osp.join(metrics_dir, f"metrics_{vis_tag}.json")
-            if os.path.exists(metrics_file):
-                import random, string
-                rand_hash = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
-                metrics_file = metrics_file.replace(".json", f"_{rand_hash}.json")
-            with open(metrics_file, "w") as f:
-                json.dump(basic_metrics, f, indent=2)
-            logger.info(f"📌 Saved metrics to \"{metrics_file}\"")
+            if args.eval_depth:
+                logger.info("📌 Evaluating Depth")
+                gt_depth = torch.cat([view["depthmap"] for view in batch], dim=0)  # (S, H, W)
+                pred_depth = predictions["depth"]
+                if isinstance(pred_depth, np.ndarray):
+                    pred_depth = torch.from_numpy(pred_depth)
+                if pred_depth.ndim == 4 and pred_depth.shape[-1] == 1:
+                    pred_depth = pred_depth[..., 0]
+                if pred_depth.ndim == 2:
+                    pred_depth = pred_depth.unsqueeze(0)
+
+                _, h_gt, w_gt = gt_depth.shape
+                if pred_depth.shape[1:] != (h_gt, w_gt):
+                    pred_depth = pred_depth.unsqueeze(1)
+                    pred_depth = torch.nn.functional.interpolate(
+                        pred_depth, size=(h_gt, w_gt), mode="bicubic", align_corners=False
+                    )
+                    pred_depth = pred_depth.squeeze(1)
+
+                max_depth = 100.0
+                depth_metrics, _, _, _ = eval_depth(
+                    pred_depth,
+                    gt_depth,
+                    max_depth=max_depth,
+                    align_with_lad2=True,
+                    use_gpu=(device == "cuda"),
+                    post_clip_max=max_depth,
+                    verbose=False,
+                )
+                basic_metrics["depth"] = depth_metrics
+                abs_rel = _depth_metric(depth_metrics, "abs_rel", "Abs Rel")
+                rmse = _depth_metric(depth_metrics, "rmse", "RMSE")
+                log_rmse = _depth_metric(depth_metrics, "log_rmse", "Log RMSE")
+                d1 = _depth_metric(depth_metrics, "threshold_1", "delta < 1.25")
+                logger.info(
+                    "🎯 Depth AbsRel: %.4f, RMSE: %.4f, LogRMSE: %.4f, d1: %.4f",
+                    abs_rel,
+                    rmse,
+                    log_rmse,
+                    d1,
+                )
+
+            if args.eval_cam:
+                logger.info("📌 Evaluating Camera Trajectory")
+                extrinsic = predictions["extrinsic"]
+                if extrinsic.ndim == 2:
+                    extrinsic = extrinsic[None, ...]
+
+                pred_c2w = []
+                for i in range(extrinsic.shape[0]):
+                    pred_w2c = np.eye(4, dtype=np.float64)
+                    pred_w2c[:3, :4] = extrinsic[i]
+                    pred_c2w.append(np.linalg.inv(pred_w2c))
+                pred_c2w = np.stack(pred_c2w, axis=0)
+
+                gt_c2w = []
+                for view in batch:
+                    gt_pose = view["camera_pose"].squeeze().cpu().numpy()
+                    gt_c2w.append(gt_pose)
+                gt_c2w = np.stack(gt_c2w, axis=0).astype(np.float64)
+
+                traj_metrics = eval_traj(
+                    _poses_to_tum_traj(pred_c2w),
+                    _poses_to_tum_traj(gt_c2w),
+                )
+                basic_metrics["trajectory"] = traj_metrics
+                logger.info(
+                    "🎯 Traj ATE-RMSE: %.4f, RPE-Trans-RMSE: %.4f, RPE-Rot-RMSE: %.4f",
+                    traj_metrics["ate"]["rmse"],
+                    traj_metrics["rpe_trans"]["rmse"],
+                    traj_metrics["rpe_rot"]["rmse"],
+                )
+
+            print_only_mode = args.eval_depth or args.eval_cam
+            if not print_only_mode:
+                # Save per-scene metrics
+                metrics_dir = osp.join(save_dir, "metrics")
+                os.makedirs(metrics_dir, exist_ok=True)
+                metrics_file = osp.join(metrics_dir, f"metrics_{vis_tag}.json")
+                if os.path.exists(metrics_file):
+                    import random, string
+                    rand_hash = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
+                    metrics_file = metrics_file.replace(".json", f"_{rand_hash}.json")
+                with open(metrics_file, "w") as f:
+                    json.dump(basic_metrics, f, indent=2)
+                logger.info(f"📌 Saved metrics to \"{metrics_file}\"")
 
             all_metrics[scene_name] = basic_metrics
 
@@ -376,46 +489,79 @@ def main(args):
                 row[col] = (nc1 + nc2) / 2 if (nc1 is not None and nc2 is not None) else None
         return row
 
-    accum = {c: [] for c in display_cols}
-    scene_rows = []
-    for scene, info in all_metrics.items():
-        recon = info.get("reconstruction", {})
-        row = {"scene": scene, **_get_row_vals(recon)}
+    if not args.no_recon:
+        accum = {c: [] for c in display_cols}
+        scene_rows = []
+        for scene, info in all_metrics.items():
+            recon = info.get("reconstruction", {})
+            row = {"scene": scene, **_get_row_vals(recon)}
+            for c in display_cols:
+                if row[c] is not None:
+                    accum[c].append(row[c])
+            scene_rows.append(row)
+
+        def _fmt(v):
+            return f"{v:.4f}" if isinstance(v, float) else (str(v) if v is not None else "-")
+
+        header_cols = ["scene"] + display_cols
+        col_w = {c: max(len(c), 8) for c in header_cols}
+        for row in scene_rows:
+            for c in header_cols:
+                col_w[c] = max(col_w[c], len(_fmt(row.get(c))))
+
+        sep = "  "
+        header_str = sep.join(c.ljust(col_w[c]) for c in header_cols)
+        hline = sep.join("-" * col_w[c] for c in header_cols)
+        mean_row = {"scene": f"MEAN({len(scene_rows)})"}
         for c in display_cols:
-            if row[c] is not None:
-                accum[c].append(row[c])
-        scene_rows.append(row)
+            vals = accum[c]
+            mean_row[c] = sum(vals) / len(vals) if vals else float("nan")
 
-    def _fmt(v):
-        return f"{v:.4f}" if isinstance(v, float) else (str(v) if v is not None else "-")
+        table_lines = [
+            "",
+            "📊 Reconstruction Evaluation Summary",
+            header_str,
+            hline,
+        ]
+        for row in scene_rows:
+            table_lines.append(sep.join(_fmt(row.get(c)).ljust(col_w[c]) for c in header_cols))
+        table_lines.append(hline)
+        table_lines.append(sep.join(_fmt(mean_row.get(c)).ljust(col_w[c]) for c in header_cols))
+        logger.info("\n".join(table_lines))
 
-    header_cols = ["scene"] + display_cols
-    col_w = {c: max(len(c), 8) for c in header_cols}
-    for row in scene_rows:
-        for c in header_cols:
-            col_w[c] = max(col_w[c], len(_fmt(row.get(c))))
+    if args.eval_depth:
+        depth_rows = []
+        for scene, info in all_metrics.items():
+            depth = info.get("depth")
+            if depth is None:
+                continue
+            depth_rows.append(
+                (
+                    scene,
+                    _depth_metric(depth, "abs_rel", "Abs Rel"),
+                    _depth_metric(depth, "rmse", "RMSE"),
+                    _depth_metric(depth, "log_rmse", "Log RMSE"),
+                    _depth_metric(depth, "threshold_1", "delta < 1.25"),
+                )
+            )
+        if depth_rows:
+            logger.info("\n📊 Depth Summary (scene, abs_rel, rmse, log_rmse, d1)")
+            for row in depth_rows:
+                logger.info("%s: %.4f, %.4f, %.4f, %.4f", row[0], row[1], row[2], row[3], row[4])
 
-    sep = "  "
-    header_str = sep.join(c.ljust(col_w[c]) for c in header_cols)
-    hline = sep.join("-" * col_w[c] for c in header_cols)
-    mean_row = {"scene": f"MEAN({len(scene_rows)})"}
-    for c in display_cols:
-        vals = accum[c]
-        mean_row[c] = sum(vals) / len(vals) if vals else float("nan")
+    if args.eval_cam:
+        traj_rows = []
+        for scene, info in all_metrics.items():
+            traj = info.get("trajectory")
+            if traj is None:
+                continue
+            traj_rows.append((scene, traj["ate"]["rmse"], traj["rpe_trans"]["rmse"], traj["rpe_rot"]["rmse"]))
+        if traj_rows:
+            logger.info("\n📊 Trajectory Summary (scene, ate_rmse, rpe_trans_rmse, rpe_rot_rmse)")
+            for row in traj_rows:
+                logger.info("%s: %.4f, %.4f, %.4f", row[0], row[1], row[2], row[3])
 
-    table_lines = [
-        "",
-        "📊 Reconstruction Evaluation Summary",
-        header_str,
-        hline,
-    ]
-    for row in scene_rows:
-        table_lines.append(sep.join(_fmt(row.get(c)).ljust(col_w[c]) for c in header_cols))
-    table_lines.append(hline)
-    table_lines.append(sep.join(_fmt(mean_row.get(c)).ljust(col_w[c]) for c in header_cols))
-    logger.info("\n".join(table_lines))
-
-    if len(list(data_idx)) > 1:
+    if len(list(data_idx)) > 1 and not (args.eval_depth or args.eval_cam):
         overall_metrics_dir = osp.join(args.output_dir, args.dataset_type, args.base_model,
                                        "overall_metrics", f"kf_{args.kf_every}")
         os.makedirs(overall_metrics_dir, exist_ok=True)

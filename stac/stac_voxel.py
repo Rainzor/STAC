@@ -248,8 +248,9 @@ class STACVoxelKV(HeavyHittersKV):
         K_all = K_all.unsqueeze(0).transpose(1, 2).contiguous()
         V_all = V_all.unsqueeze(0).transpose(1, 2).contiguous()
         q = query_states.contiguous()
+        use_cuda = bool(_USE_ATTN_CUDA and _ATTN_CUDA_AVAILABLE)
 
-        if _USE_ATTN_CUDA and _ATTN_CUDA_AVAILABLE:
+        if use_cuda:
             out, _, col_sum = _attn_cuda.flash_attn_bias_colsum(
                 q, K_all, V_all, bias=bias, return_colsum=True, subsample_ratio=_SUBSAMPLE)
         else:

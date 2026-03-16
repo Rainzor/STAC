@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
 #include <vector>
 #include <string>
 

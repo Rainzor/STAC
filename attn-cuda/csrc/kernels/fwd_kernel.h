@@ -213,26 +213,60 @@ fwd_bias_colsum_kernel(StacFlashParams params)
     // Load tile helpers
     auto load_k_tile = [&](int n_block, int stage) {
         int const row_limit = seqlen_k - n_block * kBlockN;
+        bool const even_n = (seqlen_k % kBlockN) == 0;
+        bool const is_tail_block = (!even_n) && (n_block == (n_block_max - 1));
         #pragma unroll
         for (int m = 0; m < size<1>(tKgK); ++m) {
-            bool pred_m = get<0>(t0KVcKV(_0{}, m, _0{})) < row_limit;
+            bool pred_m = get<0>(tKVcKV(_0{}, m, _0{})) < row_limit;
             #pragma unroll
             for (int k = 0; k < size<2>(tKgK); ++k) {
-                cute::copy(gmem_tiled_copy.with(pred_m && tKVpKV(k)),
-                           tKgK(_, m, k, n_block), tKsK(_, m, k, stage));
+                if (!is_tail_block) {
+                    cute::copy(gmem_tiled_copy.with(pred_m && tKVpKV(k)),
+                               tKgK(_, m, k, n_block), tKsK(_, m, k, stage));
+                } else {
+                    // Tail-safe path for K: only copy when all lanes are in-bounds.
+                    bool pred_all = pred_m && tKVpKV(k);
+                    #pragma unroll
+                    for (int v = 0; v < size<0>(tKVcKV); ++v) {
+                        pred_all = pred_all && (get<0>(tKVcKV(v, m, k)) < row_limit);
+                    }
+                    if (pred_all) {
+                        cute::copy(gmem_tiled_copy.with(true),
+                                   tKgK(_, m, k, n_block), tKsK(_, m, k, stage));
+                    } else {
+                        cute::fill(tKsK(_, m, k, stage), Element(0));
+                    }
+                }
             }
         }
     };
 
     auto load_v_tile = [&](int n_block, int stage) {
         int const row_limit = seqlen_k - n_block * kBlockN;
+        bool const even_n = (seqlen_k % kBlockN) == 0;
+        bool const is_tail_block = (!even_n) && (n_block == (n_block_max - 1));
         #pragma unroll
         for (int m = 0; m < size<1>(tVgV); ++m) {
-            bool pred_m = get<0>(t0KVcKV(_0{}, m, _0{})) < row_limit;
+            bool pred_m = get<0>(tKVcKV(_0{}, m, _0{})) < row_limit;
             #pragma unroll
             for (int k = 0; k < size<2>(tVgV); ++k) {
-                cute::copy(gmem_tiled_copy.with(pred_m && tKVpKV(k)),
-                           tVgV(_, m, k, n_block), tVsV(_, m, k, stage));
+                if (!is_tail_block) {
+                    cute::copy(gmem_tiled_copy.with(pred_m && tKVpKV(k)),
+                               tVgV(_, m, k, n_block), tVsV(_, m, k, stage));
+                } else {
+                    // Tail-safe path for V mirrors K to avoid partial-lane stale values.
+                    bool pred_all = pred_m && tKVpKV(k);
+                    #pragma unroll
+                    for (int v = 0; v < size<0>(tKVcKV); ++v) {
+                        pred_all = pred_all && (get<0>(tKVcKV(v, m, k)) < row_limit);
+                    }
+                    if (pred_all) {
+                        cute::copy(gmem_tiled_copy.with(true),
+                                   tVgV(_, m, k, n_block), tVsV(_, m, k, stage));
+                    } else {
+                        cute::fill(tVsV(_, m, k, stage), Element(0));
+                    }
+                }
             }
         }
     };
