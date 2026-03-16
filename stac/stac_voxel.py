@@ -16,6 +16,13 @@ logger = logging.getLogger(__name__)
 
 _SUBSAMPLE = float(os.environ.get("SUBSAMPLE", "1.0"))
 
+# External switch: set ATTN_CUDA=1 to use CUDA attention (when attn_cuda is installed)
+_USE_ATTN_CUDA = os.environ.get("ATTN_CUDA", "0").strip().lower() in ("1", "true", "yes")
+try:
+    import attn_cuda as _attn_cuda
+    _ATTN_CUDA_AVAILABLE = getattr(_attn_cuda, "is_available", lambda: True)()
+except Exception:
+    _ATTN_CUDA_AVAILABLE = False
 
 class STACVoxelKV(HeavyHittersKV):
     """
@@ -140,6 +147,7 @@ class STACVoxelKV(HeavyHittersKV):
             self._vk_conf["seg_size"],
             getattr(self, "_stac_cpu_offload_str", ""),
         )
+        logger.info(f"ATTN_CUDA: {_USE_ATTN_CUDA}, ATTN_CUDA_AVAILABLE: {_ATTN_CUDA_AVAILABLE}, SUBSAMPLE: {_SUBSAMPLE}")
 
     # ------------------------
     # reset 
@@ -241,9 +249,12 @@ class STACVoxelKV(HeavyHittersKV):
         V_all = V_all.unsqueeze(0).transpose(1, 2).contiguous()
         q = query_states.contiguous()
 
-        out, _, col_sum = fa_forward_colsum_fast_sub(
-            q, K_all, V_all, bias=bias, write_o=True,
-            subsample_ratio=_SUBSAMPLE)
+        if _USE_ATTN_CUDA and _ATTN_CUDA_AVAILABLE:
+            out, _, col_sum = _attn_cuda.flash_attn_bias_colsum(
+                q, K_all, V_all, bias=bias, return_colsum=True, subsample_ratio=_SUBSAMPLE)
+        else:
+            out, _, col_sum = fa_forward_colsum_fast_sub(
+                q, K_all, V_all, bias=bias, write_o=True, subsample_ratio=_SUBSAMPLE)
         scores_total = col_sum.unsqueeze(2)  # [B, H, 1, T_total]
 
         # update hot scores (merge scores cached separately for diagnostics)

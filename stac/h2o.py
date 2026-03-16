@@ -1,6 +1,7 @@
 # Copyright (c) 2025 STAC Authors. All rights reserved.
 
 import logging
+import os
 from typing import List, Optional, Tuple
 import torch
 import torch.nn.functional as F
@@ -9,6 +10,14 @@ import warnings
 from .kv_manager import KVManager
 
 from .flash_attn_triton import fa_forward_colsum_fast, fa_forward_colsum_fast_sub
+
+# External switch: set ATTN_CUDA=1 to use CUDA attention (when attn_cuda is installed)
+_USE_ATTN_CUDA = os.environ.get("ATTN_CUDA", "0").strip().lower() in ("1", "true", "yes")
+try:
+    import attn_cuda as _attn_cuda
+    _ATTN_CUDA_AVAILABLE = getattr(_attn_cuda, "is_available", lambda: True)()
+except Exception:
+    _ATTN_CUDA_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -138,10 +147,14 @@ class HeavyHittersKV(KVManager):
         assert q.dtype in (torch.float16, torch.bfloat16), "q must be fp16/bf16"
         assert k.dtype in (torch.float16, torch.bfloat16) and v.dtype in (torch.float16, torch.bfloat16)
 
-        out, _, col_sum = fa_forward_colsum_fast_sub(
-            q, k, v, write_o=True,
-            subsample_ratio=getattr(self, 'subsample_ratio', 1.0))
-        scores = col_sum.unsqueeze(2) #[B, H, 1, T]
+        subsample = getattr(self, "subsample_ratio", 1.0)
+        if _USE_ATTN_CUDA and _ATTN_CUDA_AVAILABLE:
+            out, _, col_sum = _attn_cuda.flash_attn_bias_colsum(
+                q, k, v, bias=None, return_colsum=True, subsample_ratio=subsample)
+        else:
+            out, _, col_sum = fa_forward_colsum_fast_sub(
+                q, k, v, write_o=True, subsample_ratio=subsample)
+        scores = col_sum.unsqueeze(2)  # [B, H, 1, T]
 
         self._last_query_offset[slot_idx] = Tq
         self._update_scores(scores, slot_idx)

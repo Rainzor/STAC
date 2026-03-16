@@ -158,10 +158,10 @@ skyseg.onnx
 *.glb
 eval_results
 eval_rebuttal
-eval_recon
+eval_recon*
 eval_cam_results
 eval_depth
-test
+test*
 .cursor
 .claude
 .specstory
