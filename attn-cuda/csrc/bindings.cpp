@@ -61,17 +61,25 @@ std::vector<torch::Tensor> flash_attn_fwd(
                 "subsample_ratio must be in (0, 1], got ", subsample_ratio);
 
     const int BLOCK_M = 128;
-    int M_sub = std::max(BLOCK_M, static_cast<int>(M * subsample_ratio));
-    M_sub = (M_sub / BLOCK_M) * BLOCK_M;
+    int M_sub;
     int q_m_stride;
     float correction;
-    if (M_sub >= M) {
+    if (subsample_ratio >= 0.999999f) {
+        // Keep full-M colsum exact when ratio=1.0.
         M_sub = M;
         q_m_stride = 1;
         correction = 1.0f;
     } else {
-        q_m_stride = std::max(1, M / M_sub);
-        correction = static_cast<float>(M) / static_cast<float>(M_sub);
+        M_sub = std::max(BLOCK_M, static_cast<int>(M * subsample_ratio));
+        M_sub = (M_sub / BLOCK_M) * BLOCK_M;
+        if (M_sub >= M) {
+            M_sub = M;
+            q_m_stride = 1;
+            correction = 1.0f;
+        } else {
+            q_m_stride = std::max(1, M / M_sub);
+            correction = static_cast<float>(M) / static_cast<float>(M_sub);
+        }
     }
 
     auto opts = q.options();

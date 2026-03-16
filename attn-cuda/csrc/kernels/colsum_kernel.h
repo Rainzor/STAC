@@ -101,7 +101,6 @@ colsum_n_major_kernel(StacFlashParams params)
         Tensor tKsK = gmem_thr_copy.partition_D(sK);
 
         Tensor cKV = cute::make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDim>>{});
-        Tensor t0cKV = gmem_thr0_copy.partition_S(cKV);
         Tensor tcKV = gmem_thr_copy.partition_S(cKV);
         Tensor tpKV = make_tensor<bool>(make_shape(size<2>(tKsK)));
         #pragma unroll
@@ -112,7 +111,7 @@ colsum_n_major_kernel(StacFlashParams params)
         int const k_row_limit = seqlen_k - n_off;
         #pragma unroll
         for (int m = 0; m < size<1>(tKgK); ++m) {
-            bool pred_m = get<0>(t0cKV(_0{}, m, _0{})) < k_row_limit;
+            bool pred_m = get<0>(tcKV(_0{}, m, _0{})) < k_row_limit;
             #pragma unroll
             for (int d = 0; d < size<2>(tKgK); ++d) {
                 cute::copy(gmem_tiled_copy.with(pred_m && tpKV(d)),

@@ -11,17 +11,30 @@ Usage:
 
 import os
 from setuptools import setup, find_packages
+import torch
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 
 _project_root = os.path.dirname(os.path.abspath(__file__))
 
-CUTLASS_DIR = os.environ.get(
-    "CUTLASS_DIR",
-    os.path.join(_project_root, "..", "attn-flash",
-                 "flash-attention", "csrc", "cutlass", "include"))
+_VENDORED_CUTLASS_DIR = os.path.join(
+    _project_root, "third_party", "cutlass", "include"
+)
+_LEGACY_CUTLASS_DIR = os.path.join(
+    _project_root, "..", "attn-flash", "flash-attention", "csrc", "cutlass", "include"
+)
 
-FA2_DIR = os.path.join(_project_root, "..", "attn-flash",
-                       "flash-attention", "hopper")
+CUTLASS_DIR = os.environ.get("CUTLASS_DIR", _VENDORED_CUTLASS_DIR)
+if not os.path.exists(os.path.join(CUTLASS_DIR, "cute", "tensor.hpp")):
+    if CUTLASS_DIR == _VENDORED_CUTLASS_DIR and os.path.exists(
+        os.path.join(_LEGACY_CUTLASS_DIR, "cute", "tensor.hpp")
+    ):
+        CUTLASS_DIR = _LEGACY_CUTLASS_DIR
+    else:
+        raise RuntimeError(
+            "CUTLASS headers not found. Expected 'cute/tensor.hpp' under "
+            f"{CUTLASS_DIR}. Set CUTLASS_DIR explicitly or vendor headers into "
+            "attn-cuda/third_party/cutlass/include."
+        )
 
 CSRC_DIR = "csrc"
 INCLUDE_DIR_ABS = os.path.join(_project_root, "csrc", "include")
@@ -31,6 +44,36 @@ sources = [
     os.path.join(CSRC_DIR, "bindings.cpp"),
     os.path.join(CSRC_DIR, "launch.cu"),
 ]
+
+
+def _choose_arch_list() -> str:
+    # 1) Project-specific override
+    arch = os.environ.get("STAC_CUDA_ARCHS")
+    if arch:
+        return arch
+
+    # 2) Standard PyTorch override
+    arch = os.environ.get("TORCH_CUDA_ARCH_LIST")
+    if arch:
+        return arch
+
+    # 3) Profile fallback
+    profile = os.environ.get("STAC_BUILD_PROFILE", "dev").strip().lower()
+    if profile == "release":
+        return "8.0;8.6;8.9;9.0+PTX"
+
+    # 4) Dev fallback: current GPU only
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability(0)
+        return f"{major}.{minor}"
+
+    # 5) Last fallback for GPU-less build hosts
+    return "8.0;8.6"
+
+
+arch_list = _choose_arch_list()
+os.environ["TORCH_CUDA_ARCH_LIST"] = arch_list
+print(f"[attn-cuda] TORCH_CUDA_ARCH_LIST={arch_list}")
 
 extra_compile_args = {
     "cxx": ["-O3", "-std=c++17"],
@@ -43,8 +86,6 @@ extra_compile_args = {
         "-U__CUDA_NO_HALF_CONVERSIONS__",
         "-U__CUDA_NO_HALF2_OPERATORS__",
         "--threads=4",
-        "-gencode=arch=compute_80,code=sm_80",
-        "-gencode=arch=compute_86,code=sm_86",
     ],
 }
 
@@ -57,7 +98,7 @@ setup(
         CUDAExtension(
             name="attn_cuda._ext",
             sources=sources,
-            include_dirs=[INCLUDE_DIR_ABS, CSRC_DIR_ABS, CUTLASS_DIR, FA2_DIR],
+            include_dirs=[INCLUDE_DIR_ABS, CSRC_DIR_ABS, CUTLASS_DIR],
             extra_compile_args=extra_compile_args,
         )
     ],
