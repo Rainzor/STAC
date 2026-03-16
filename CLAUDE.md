@@ -11,12 +11,17 @@ STAC (Sparse Token Attention Cache) is a plug-and-play KV-cache management modul
 ```bash
 conda create -n stac python=3.11 cmake=3.14.0 -y
 conda activate stac
+
+# CUDA 11.8 or CUDA 12.8
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
 
-# Optional: CUDA KV merger (requires CUDA_HOME set)
+# CUDA KV merger (requires CUDA_HOME set)
 export CUDA_HOME=/usr/local/cuda-12.8
 pip install -e merger-cuda --no-build-isolation
+
+# CUDA attention extension (attn-cuda)
+pip install -e attn-cuda --no-build-isolation
 ```
 
 Checkpoints go under `ckpt/{stream3r,streamvggt}/` as `model.safetensors` or `model.pt` (auto-detected by `model_wrapper`).
@@ -48,6 +53,12 @@ bash eval/video_depth/run.sh
 
 # Verbose KV cache stats
 VERBOSE=1 python eval/long_recon/launch.py ...
+
+# Enable attn-cuda backend in STAC decoding
+ATTN_CUDA=1 python eval/long_recon/launch.py ...
+
+# Optional: colsum subsampling for attn-cuda path
+ATTN_CUDA=1 SUBSAMPLE=0.25 python eval/long_recon/launch.py ...
 
 # Demos
 python demo/app_stream3r.py          # Gradio web UI
@@ -91,7 +102,7 @@ Per-step lifecycle in streaming: `append_kv` (layer-wise) → `decode_sparse_att
 ### Attention modes
 
 | Mode | Key |
-|:---|:---|
+| :--- | :--- |
 | `stac` | **Recommended** preset — expands to `window_chunk_merge` + streaming + default params (win=4, ck=4, hh=2, ret_sz=2, ret_buf) |
 | `window_chunk_merge` | Chunked sliding window + voxel-based spatial KV merging (manual param tuning) |
 | `window_merge` | Window + voxel merging (no chunking) |
@@ -106,6 +117,25 @@ Per-step lifecycle in streaming: `append_kv` (layer-wise) → `decode_sparse_att
 ### CUDA extension (`merger-cuda/`)
 
 Optional GPU-accelerated voxel merging. Built with `torch.utils.cpp_extension.CUDAExtension`. Enabled via `--voxel_backend cuda`. Source in `csrc/` with C++17/CUDA kernels.
+
+### CUDA attention extension (`attn-cuda/`)
+
+Optional CUDA flash-attention extension used by STAC decode path. Exposes
+`flash_attn_bias_colsum` (forward + optional bias + optional colsum).
+
+- Install: `pip install -e attn-cuda --no-build-isolation`
+- Enable at runtime: `ATTN_CUDA=1`
+- Optional colsum subsampling: `SUBSAMPLE=0.25` (or other ratio in (0, 1])
+- Regression test: `python -u attn-cuda/tests/compare_cuda_triton.py`
+
+Build architecture selection in `attn-cuda/setup.py`:
+
+1. `STAC_CUDA_ARCHS` (project override)
+2. `TORCH_CUDA_ARCH_LIST` (PyTorch standard override)
+3. `STAC_BUILD_PROFILE=release` fallback -> `8.0;8.6;8.9;9.0+PTX`
+4. Current GPU capability (dev fallback)
+5. Final fallback -> `8.0;8.6`
+
 
 ## Data layout
 

@@ -1,0 +1,13 @@
+This directory vendors a subset of NVIDIA CUTLASS/CuTe header files
+required to build `attn-cuda`.
+
+Source project:
+  https://github.com/NVIDIA/cutlass
+
+Original license:
+  BSD-3-Clause (see LICENSE.txt in this directory)
+
+Local provenance:
+  Imported from CUTLASS include tree via an existing flash-attention dependency.
+  The copied headers are redistributed unchanged except for path relocation
+  into this repository's third_party tree.

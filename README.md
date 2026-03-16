@@ -4,6 +4,7 @@
 
 - [Overview](#overview)
 - [Installation](#installation)
+- [CUDA attention extension (attn-cuda)](#cuda-attention-extension-attn-cuda)
 - [Quick Start](#quick-start)
 - [Data preparation](#data-preparation)
 - [Evaluation](#evaluation)
@@ -34,6 +35,7 @@ Feed-forward 3D models ([STream3R](https://github.com/NIRVANALAN/STream3R), [Str
 - **On-demand pivot retrieval** — attention-score–guided selection of historical tokens per step.
 - **H2O heavy-hitter selection** — keeps high-attention tokens in cache for quality.
 - **Optional CUDA merger** — `--voxel_backend cuda` for faster merging (build `merger-cuda`).
+- **Optional CUDA attention extension** — `attn-cuda` provides a custom FlashAttention forward (+ optional bias + colsum) backend used by STAC decoding.
 - **StreamSession** — frame-by-frame inference with prediction accumulation.
 
 ## Architecture
@@ -109,6 +111,30 @@ pip install -r requirements.txt
 pip install -e merger-cuda --no-build-isolation
 ```
 
+## CUDA attention extension (`attn-cuda`)
+
+`attn-cuda` is an optional CUDA extension used by STAC attention decoding. It provides:
+
+- FlashAttention forward (`out`, `lse`)
+- Optional vector bias (`[B,H,N]` / `[B,H,1,N]` / `[1,H,1,N]`)
+- Optional column-sum (`colsum`) for retrieval scoring
+- Optional colsum subsampling (`subsample_ratio`)
+
+Build from repo root:
+
+```bash
+pip install -e attn-cuda --no-build-isolation
+```
+
+Runtime switches:
+
+```bash
+# Enable attn-cuda path in STAC
+ATTN_CUDA=1 python eval/long_recon/launch.py ...
+
+# Optional colsum subsampling ratio used by attn-cuda path
+ATTN_CUDA=1 SUBSAMPLE=0.25 python eval/long_recon/launch.py ...
+```
 ### Checkpoints
 
 Place backbone weights under `ckpt/{stream3r|streamvggt}/` as `model.safetensors` or `model.pt` (auto-detected).
@@ -218,7 +244,7 @@ Common flags: `--model_name causalvggt --base_model stream3r --mode stac`. Eval 
 | `--kf_every`       |            | 1              | Process every N-th frame                                       |
 
 
-**Env:** `VERBOSE=1` — per-frame KV stats; `MERGER_MEM_PROFILE=1` — CUDA memory fragmentation at cleanup.
+**Env:** `VERBOSE=1` — per-frame KV stats; `MERGER_MEM_PROFILE=1` — CUDA memory fragmentation at cleanup; `ATTN_CUDA=1` — enable attn-cuda backend; `SUBSAMPLE=0.25` — colsum subsampling ratio for attn-cuda path.
 
 ## Project structure
 
@@ -233,6 +259,7 @@ Common flags: `--model_name causalvggt --base_model stream3r --mode stac`. Eval 
 | `eval/long_recon/`, `cam_pose/`, `video_depth/` | 3D recon, pose, depth                                                        |
 | `demo/`                                         | Gradio app, Viser, COLMAP                                                    |
 | `merger-cuda/`                                  | CUDA KV merger extension                                                     |
+| `attn-cuda/`                                    | CUDA attention extension (FlashAttention forward + bias + colsum)            |
 
 
 ## Citation
@@ -274,4 +301,13 @@ STAC builds upon the following excellent open-source projects:
 
 ## License
 
-Please refer to the licenses of the upstream projects ([VGGT](https://github.com/facebookresearch/vggt), [STream3R](https://github.com/NIRVANALAN/STream3R), [StreamVGGT](https://github.com/wzzheng/StreamVGGT)) for usage terms.
+STAC source code in this repository is licensed under the MIT License.
+See the top-level `LICENSE` file.
+
+Third-party components may use different licenses:
+
+- Vendored CUTLASS/CuTe headers under `attn-cuda/third_party/cutlass/` are licensed by NVIDIA under BSD-3-Clause (see `attn-cuda/third_party/cutlass/LICENSE.txt` and `attn-cuda/third_party/cutlass/NOTICE`).
+- Upstream model/backbone projects retain their own licenses and terms:
+  [VGGT](https://github.com/facebookresearch/vggt),
+  [STream3R](https://github.com/NIRVANALAN/STream3R),
+  [StreamVGGT](https://github.com/wzzheng/StreamVGGT).
