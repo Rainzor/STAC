@@ -135,6 +135,11 @@ def get_args_parser():
                         help="Whether to return retrieved K/V pairs from the buffer")
     parser.add_argument("--temperature", type=float, default=0.9,
                         help="Temperature for softmax in attention-based retrieval")
+    parser.add_argument("--attn_backend", type=str, default="cuda",
+                        choices=["cuda", "triton"],
+                        help="Attention backend for sparse decode: cuda or triton")
+    parser.add_argument("--subsample", type=float, default=1.0,
+                        help="Colsum subsampling ratio in (0, 1]")
     
     # Voxel
     parser.add_argument("--voxel_size", type=float, default=0.05,
@@ -174,6 +179,8 @@ def run(images, model, dtype, device, args):
         "retrieval_size": args.retrieval_size,
         "return_buf": args.retrieve_buf,
         "temperature": args.temperature,
+        "attn_backend": args.attn_backend,
+        "subsample_ratio": args.subsample,
         "voxel_size": args.voxel_size,
         "voxel_num": args.voxel_num,
         "conf_threshold": args.voxel_conf,

@@ -1,7 +1,6 @@
 # Copyright (c) 2025 STAC Authors. All rights reserved.
 
 import logging
-import os
 from typing import List, Optional, Tuple
 import torch
 import torch.nn.functional as F
@@ -11,8 +10,6 @@ from .kv_manager import KVManager
 
 from .flash_attn_triton import fa_forward_colsum_fast, fa_forward_colsum_fast_sub
 
-# External switch: set ATTN_CUDA=1 to use CUDA attention (when attn_cuda is installed)
-_USE_ATTN_CUDA = os.environ.get("ATTN_CUDA", "0").strip().lower() in ("1", "true", "yes")
 try:
     import attn_cuda as _attn_cuda
     _ATTN_CUDA_AVAILABLE = getattr(_attn_cuda, "is_available", lambda: True)()
@@ -37,12 +34,19 @@ class HeavyHittersKV(KVManager):
                  *args,
                  hh_size: int = 0,            # heavy-hitter "frame-equivalent" count -> converted to tokens
                  temperature: float = 1.0,
+                 attn_backend: str = "cuda",
                  subsample_ratio: float = 1.0,
                  **kwargs
                  ):
         super().__init__(*args,
                          **kwargs)
+        self.attn_backend = str(attn_backend).strip().lower()
+        if self.attn_backend not in ("cuda", "triton"):
+            raise ValueError(f"attn_backend must be 'cuda' or 'triton', got '{attn_backend}'.")
         self.subsample_ratio = float(subsample_ratio)
+        if not (0.0 < self.subsample_ratio <= 1.0):
+            raise ValueError(f"subsample_ratio must be in (0, 1], got {self.subsample_ratio}.")
+        self.use_attn_cuda = (self.attn_backend == "cuda")
 
         # Metadata Update
         self.hh_size = int(hh_size)
@@ -73,6 +77,14 @@ class HeavyHittersKV(KVManager):
         super()._log_registration()
         logger.info("[H2OKV] anchor tok=%dx%d  temperature=%.2f",
                     self.hh_size, self.token_per_f, self.temperature)
+        use_cuda = bool(self.use_attn_cuda and _ATTN_CUDA_AVAILABLE)
+        logger.info(
+            "[ATTENTION] backend=%s (cuda_available=%s, effective_cuda=%s)  subsample_ratio=%.3f",
+            self.attn_backend,
+            _ATTN_CUDA_AVAILABLE,
+            use_cuda,
+            self.subsample_ratio,
+        )
 
     #------ Utility functions ------
     def _estimate_scores(self, slot_idx: int, T_live: int) -> torch.Tensor:
@@ -148,7 +160,7 @@ class HeavyHittersKV(KVManager):
         assert k.dtype in (torch.float16, torch.bfloat16) and v.dtype in (torch.float16, torch.bfloat16)
 
         subsample = getattr(self, "subsample_ratio", 1.0)
-        if _USE_ATTN_CUDA and _ATTN_CUDA_AVAILABLE:
+        if self.use_attn_cuda and _ATTN_CUDA_AVAILABLE:
             out, _, col_sum = _attn_cuda.flash_attn_bias_colsum(
                 q, k, v, bias=None, return_colsum=True, subsample_ratio=subsample)
         else:

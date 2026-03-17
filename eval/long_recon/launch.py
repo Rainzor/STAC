@@ -101,6 +101,11 @@ def get_args_parser():
     parser.add_argument("--retrieval_size", "-ret_sz", type=int, default=0)
     parser.add_argument("--retrieve_buf", "-ret_buf", action="store_true")
     parser.add_argument("--temperature", type=float, default=0.9)
+    parser.add_argument("--attn_backend", type=str, default="cuda",
+                        choices=["cuda", "triton"],
+                        help="Attention backend for sparse decode: cuda or triton")
+    parser.add_argument("--subsample", type=float, default=1.0,
+                        help="Colsum subsampling ratio in (0, 1]")
     parser.add_argument("--pinned", type=int, default=[0], nargs="+")
 
     # voxel
@@ -161,6 +166,8 @@ def run(images, model, dtype, device, args):
         "retrieval_size": args.retrieval_size,
         "return_buf": args.retrieve_buf,
         "temperature": args.temperature,
+        "attn_backend": args.attn_backend,
+        "subsample_ratio": args.subsample,
         "voxel_size": args.voxel_size,
         "voxel_num": args.voxel_num,
         "conf_threshold": args.voxel_conf,
@@ -220,6 +227,8 @@ def run(images, model, dtype, device, args):
             model_stats["chunk_size"] = args.chunk_size
             model_stats["pinned_frame_indices"] = args.pinned
             model_stats["temperature"] = args.temperature
+            model_stats["attn_backend"] = args.attn_backend
+            model_stats["subsample_ratio"] = args.subsample
             model_stats["voxel_size"] = args.voxel_size
             model_stats["voxel_num"] = args.voxel_num
             model_stats["conf_threshold"] = args.voxel_conf

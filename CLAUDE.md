@@ -54,11 +54,11 @@ bash eval/video_depth/run.sh
 # Verbose KV cache stats
 VERBOSE=1 python eval/long_recon/launch.py ...
 
-# Enable attn-cuda backend in STAC decoding
-ATTN_CUDA=1 python eval/long_recon/launch.py ...
+# Enable CUDA attention backend in STAC decoding
+python eval/long_recon/launch.py --attn_backend cuda ...
 
-# Optional: colsum subsampling for attn-cuda path
-ATTN_CUDA=1 SUBSAMPLE=0.25 python eval/long_recon/launch.py ...
+# Optional: colsum subsampling for sparse decode
+python eval/long_recon/launch.py --attn_backend cuda --subsample 0.25 ...
 
 # Demos
 python demo/app_stream3r.py          # Gradio web UI
@@ -124,8 +124,8 @@ Optional CUDA flash-attention extension used by STAC decode path. Exposes
 `flash_attn_bias_colsum` (forward + optional bias + optional colsum).
 
 - Install: `pip install -e attn-cuda --no-build-isolation`
-- Enable at runtime: `ATTN_CUDA=1`
-- Optional colsum subsampling: `SUBSAMPLE=0.25` (or other ratio in (0, 1])
+- Enable at runtime: `--attn_backend cuda` (default)
+- Optional colsum subsampling: `--subsample 0.25` (or other ratio in (0, 1])
 - Regression test: `python -u attn-cuda/tests/compare_cuda_triton.py`
 
 Build architecture selection in `attn-cuda/setup.py`:
@@ -135,7 +135,6 @@ Build architecture selection in `attn-cuda/setup.py`:
 3. `STAC_BUILD_PROFILE=release` fallback -> `8.0;8.6;8.9;9.0+PTX`
 4. Current GPU capability (dev fallback)
 5. Final fallback -> `8.0;8.6`
-
 
 ## Data layout
 
