@@ -4,11 +4,9 @@
 
 - [Overview](#overview)
 - [Installation](#installation)
-- [CUDA attention extension (attn-cuda)](#cuda-attention-extension-attn-cuda)
-- [Recommended project layout](#recommended-project-layout)
+- [Checkpoints and Datasets Preparation](#checkpoints-and-datasets-preparation)
 - [Quick Start](#quick-start)
 - [Demos](#demos)
-- [Data preparation](#data-preparation)
 - [Evaluation](#evaluation)
 - [Key arguments](#key-arguments)
 - [Architecture](#architecture)
@@ -62,13 +60,17 @@ pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128
 pip install -r requirements.txt
 ```
 
-**Install CUDA KV merger** (faster `--voxel_backend cuda`): set `CUDA_HOME` to your CUDA root, then:
+### CUDA KV merger (`merger-cuda`)
+
+`merger-cuda` is an optional CUDA extension for faster voxel merging (`--voxel_backend cuda`).
+
+Build from repo root (with `CUDA_HOME` set):
 
 ```bash
 pip install -e merger-cuda --no-build-isolation
 ```
 
-## CUDA attention extension (`attn-cuda`)
+### CUDA attention extension (`attn-cuda`)
 
 `attn-cuda` is an optional CUDA extension used by STAC attention decoding. It provides:
 
@@ -93,9 +95,11 @@ python eval/long_recon/launch.py --attn_backend cuda ...
 python eval/long_recon/launch.py --attn_backend cuda --subsample 0.25 ...
 ```
 
-### Checkpoints
+## Checkpoints and Datasets Preparation
 
-Place backbone weights under `ckpt/{stream3r|streamvggt}/` as `model.safetensors` or `model.pt` (auto-detected).
+Put checkpoints and datasets in the right place so eval and demos can find them. Symlinks under `data/` are fine.
+
+**Checkpoints** — Place backbone weights under `ckpt/{stream3r|streamvggt}/` as `model.safetensors`, `model.pt`, or `model.pth` (auto-detected).
 
 
 | Backbone   | Hugging Face                                                      |
@@ -105,29 +109,31 @@ Place backbone weights under `ckpt/{stream3r|streamvggt}/` as `model.safetensors
 
 
 ```bash
+# Download at least one backbone (run from repo root)
 mkdir -p ckpt/stream3r && hf download yslan/STream3R --local-dir ckpt/stream3r
-# Similarly for streamvggt. Use HF_ENDPOINT=https://hf-mirror.com for mirrors.
+# StreamVGGT: mkdir -p ckpt/streamvggt && hf download lch01/StreamVGGT --local-dir ckpt/streamvggt
+# Use HF_ENDPOINT=https://hf-mirror.com for mirrors.
 ```
 
-## Recommended project layout
+**Datasets** — Put scenes under `data/` with layout `data/<dataset>/<scene>/images/*.png` (e.g. `data/7scenes/chess/images/`). Supported: `7scenes`, `neural_rgbd`, `DTU`, `tum`, `scannet`, `sintel`, `bonn`, `kitti`. Preprocessing follows [CUT3R](https://github.com/CUT3R/CUT3R/blob/main/docs/preprocess.md). Pre-processed eval sets: [Hugging Face](https://huggingface.co/datasets/yslan/pointmap_regression_evalsets).
 
-A typical layout for running eval and demos (symlinks under `data/` are fine):
+**Suggested layout:**
 
 ```text
 STAC/                          # run all commands from repo root
 ├── ckpt/
 │   ├── stream3r/
-│   │   └── model.safetensors   # or model.pt
+│   │   └── model.safetensors   # or model.pt / model.pth
 │   └── streamvggt/
 │       └── model.safetensors
-├── data/                       # 7scenes, neural_rgbd, DTU, tum, etc.
+├── data/
 │   └── <dataset>/<scene>/images/*.png
 ├── eval_recon/                 # 3D recon output (created by launch)
 ├── eval_cam_results/           # pose output
 └── eval_depth/                 # depth output
 ```
 
-**To run:** put at least one backbone under `ckpt/stream3r` or `ckpt/streamvggt`; use any scene dir with an `images/` subfolder (png/jpg); run from `STAC/`.
+**To run:** ensure at least one backbone in `ckpt/` and a scene with an `images/` subfolder (png/jpg); run from `STAC/`.
 
 ## Quick Start
 
@@ -153,6 +159,8 @@ images = ImgDust3r2Stream3r(images).to(device)          # convert to [0, 1]
 
 # Pick any supported backbone: "stream3r" or "streamvggt"
 model = load_model("causalvggt", base_model="stream3r", device=device)
+# Optional: override checkpoint location (file or directory)
+# model = load_model("causalvggt", base_model="stream3r", device=device, model_path="/path/to/model.pth")
 
 # mode="stac" auto-enables streaming + recommended STAC params
 predictions = run_model(model, images, "causalvggt", mode="stac")
@@ -175,20 +183,23 @@ model = load_model("causalvggt", base_model="streamvggt", device=device)
 # Recommended: use the STAC preset.
 # --mode stac expands to:
 #   mode=window_chunk_merge, streaming=True, win=4, ck=4, hh=2, ret_sz=2, ret_buf=True
-python eval/long_recon/launch.py --output_dir eval_recon --dataset_type NRGBD \
+python eval/long_recon/launch.py --output_dir eval_recon 
+    --dataset_type NRGBD \
     --model_name causalvggt --base_model stream3r \
     --mode stac --save_tag stac
 
-# Optional: override individual STAC parameters.
-python eval/long_recon/launch.py --output_dir eval_recon --dataset_type NRGBD \
-    --model_name causalvggt --base_model stream3r \
-    --mode stac -win 8 -hh 4
-
 # Equivalent explicit configuration (same as `--mode stac` defaults).
-python eval/long_recon/launch.py --output_dir eval_recon --dataset_type NRGBD \
+python eval/long_recon/launch.py --output_dir eval_recon 
+    --dataset_type NRGBD \
     --model_name causalvggt --base_model stream3r \
     --mode window_chunk_merge --streaming \
     -ck 4 -win 4 -hh 2 -ret_sz 2 -ret_buf
+
+# Evaluate with window size 8
+python eval/long_recon/launch.py --output_dir eval_recon 
+    --dataset_type NRGBD \
+    --model_name causalvggt --base_model stream3r \
+    --mode window_kv --streaming -win 8
 ```
 
 ## Demos
@@ -197,20 +208,16 @@ python eval/long_recon/launch.py --output_dir eval_recon --dataset_type NRGBD \
 - **Viser 3D:** `python demo/demo_viser.py --scene_dir /path/to/scene`
 - **COLMAP:** `python demo/demo_colmap.py --scene_dir /path/to/scene --output_dir output/colmap`
 
-## Data preparation
-
-Put datasets under `data/` (symlinks OK): `7scenes/`, `neural_rgbd/`, `DTU/`, `tum/`, `scannet/`, `sintel/`, `bonn/`, `kitti/`. Preprocessing follows [CUT3R](https://github.com/CUT3R/CUT3R/blob/main/docs/preprocess.md); pre-processed sets: [Hugging Face](https://huggingface.co/datasets/yslan/pointmap_regression_evalsets). Example: `ln -s /path/to/7scenes data/7scenes`.
-
 ## Evaluation
 
 Use `--base_model` to switch backbones. Batch run:
 
 
-| Task              | Batch script                   | Single-run entry                                                               |
-| ----------------- | ------------------------------ | ------------------------------------------------------------------------------ |
-| 3D reconstruction | `bash eval/long_recon/run.sh`  | `eval/long_recon/launch.py` (e.g. `--dataset_type NRGBD`)                      |
-| Camera pose       | `bash eval/cam_pose/run.sh`    | `eval/cam_pose/launch.py` (e.g. `--dataset_type tum`)                          |
-| Video depth       | `bash eval/video_depth/run.sh` | `eval/video_depth/launch.py` && `eval/video_depth/eval_depth.py --align scale` |
+| Task              | Batch script                                         | Single-run entry                                                               |
+| ----------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------ |
+| 3D reconstruction | `[eval/long_recon/run.sh](eval/long_recon/run.sh)`   | `eval/long_recon/launch.py` (e.g. `--dataset_type NRGBD --scene_name complete_kitchen`)                      |
+| Camera pose       | `[eval/cam_pose/run.sh](eval/cam_pose/run.sh)`       | `eval/cam_pose/launch.py` (e.g. `--dataset_type tum`)                          |
+| Video depth       | `[eval/video_depth/run.sh](eval/video_depth/run.sh)` | `eval/video_depth/launch.py` && `eval/video_depth/eval_depth.py --align scale` |
 
 
 Common flags: `--model_name causalvggt --base_model stream3r --mode stac`. Eval scripts default to `--voxel_backend cuda` and `--allocator segment`.

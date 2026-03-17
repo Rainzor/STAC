@@ -27,21 +27,37 @@ stream_sessions = {
     "causalvggt": StreamSession
 }
 
-def _load_checkpoint(ckpt_dir):
-    """Load checkpoint from a directory, preferring safetensors over pt."""
-    safetensors_path = os.path.join(ckpt_dir, 'model.safetensors')
-    pt_path = os.path.join(ckpt_dir, 'model.pt')
+def _load_checkpoint(ckpt_path):
+    """Load checkpoint from a file path or from a directory."""
+    if os.path.isfile(ckpt_path):
+        if ckpt_path.endswith(".safetensors"):
+            logger.info(f"Loading checkpoint from {ckpt_path}")
+            return load_safetensors(ckpt_path)
+        if ckpt_path.endswith(".pt") or ckpt_path.endswith(".pth"):
+            logger.info(f"Loading checkpoint from {ckpt_path}")
+            return torch.load(ckpt_path, map_location="cpu")
+        raise ValueError(
+            f"Unsupported checkpoint file: {ckpt_path}. "
+            "Expected '.safetensors', '.pt', or '.pth'."
+        )
+
+    safetensors_path = os.path.join(ckpt_path, 'model.safetensors')
+    pt_path = os.path.join(ckpt_path, 'model.pt')
+    pth_path = os.path.join(ckpt_path, 'model.pth')
     if os.path.isfile(safetensors_path):
         logger.info(f"Loading checkpoint from {safetensors_path}")
         return load_safetensors(safetensors_path)
-    elif os.path.isfile(pt_path):
+    if os.path.isfile(pt_path):
         logger.info(f"Loading checkpoint from {pt_path}")
         return torch.load(pt_path, map_location="cpu")
-    else:
-        raise FileNotFoundError(
-            f"No checkpoint found in {ckpt_dir}. "
-            f"Expected 'model.safetensors' or 'model.pt'."
-        )
+    if os.path.isfile(pth_path):
+        logger.info(f"Loading checkpoint from {pth_path}")
+        return torch.load(pth_path, map_location="cpu")
+    raise FileNotFoundError(
+        f"No checkpoint found at {ckpt_path}. "
+        "Expected a file path (*.safetensors, *.pt, or *.pth), "
+        "or a directory containing 'model.safetensors', 'model.pt', or 'model.pth'."
+    )
 
 def _safe_load_state_dict(model, ckpt):
     """Load state dict allowing extra keys (unused heads) but rejecting missing ones."""
@@ -52,15 +68,15 @@ def _safe_load_state_dict(model, ckpt):
         logger.info(f"Skipped {len(result.unexpected_keys)} extra checkpoint keys "
                      f"(unused heads): {result.unexpected_keys[:5]}{'...' if len(result.unexpected_keys) > 5 else ''}")
 
-def load_model(model_name, base_model='stream3r', device='cuda'):
+def load_model(model_name, base_model='stream3r', device='cuda', model_path=None):
     if model_name != "causalvggt":
         raise ValueError(f"Unsupported model_name '{model_name}'. Only 'causalvggt' is supported.")
     if base_model not in model_paths:
         raise ValueError(f"Unsupported base_model '{base_model}'. Choose from: {list(model_paths.keys())}")
 
     model = model_wrappers[model_name](base_model=base_model)
-    ckpt_dir = model_paths[base_model]
-    ckpt = _load_checkpoint(ckpt_dir)
+    ckpt_source = model_path if model_path is not None else model_paths[base_model]
+    ckpt = _load_checkpoint(ckpt_source)
     _safe_load_state_dict(model, ckpt)
     model.eval()
     model = model.to(device)
