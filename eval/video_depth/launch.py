@@ -109,7 +109,7 @@ def get_args_parser():
     parser.add_argument("--model_name", type=str, default="causalvggt")
     parser.add_argument("--base_model", type=str, default="stream3r", choices=["stream3r", "streamvggt"], help="Base model for CausalVGGT")
 
-    parser.add_argument("--mode", type=str, default="full",
+    parser.add_argument("--mode", type=str, default="stac",
                         help="Processing mode")
 
     parser.add_argument("--use_cam_cache", action="store_true",
@@ -121,7 +121,7 @@ def get_args_parser():
                         help="Use streaming mode (sequential processing)")
     
     # KV Cache
-    parser.add_argument("--pinned", type=int, default=[0], nargs="*",
+    parser.add_argument("--pinned", type=int, default=[0], nargs="+",
                         help="List of pinned frame indices (default: [0])")
     parser.add_argument("--chunk_size", '-ck',type=int, default=1,
                         help="Chunk size for chunked processing modes")

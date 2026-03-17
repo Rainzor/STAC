@@ -88,6 +88,8 @@ Feed-forward 3D models ([STream3R](https://github.com/NIRVANALAN/STream3R), [Str
 
 ## Installation
 
+> **Tested GPUs:** NVIDIA RTX 3090 (24 GB) and A100 (40 GB).
+
 ```bash
 git clone https://github.com/Rainzor/STAC.git
 cd STAC
@@ -220,29 +222,49 @@ Common flags: `--model_name causalvggt --base_model stream3r --mode stac`. Eval 
 
 ## Key arguments
 
+The arguments below are used by the evaluation and inference pipeline. **Not every script exposes all of them:** `eval/long_recon/launch.py` supports the full set; `eval/cam_pose/launch.py` and `eval/video_depth/launch.py` support a subset (model, mode, streaming, window/chunk/hh/retrieval, voxel_backend, size, etc.). For programmatic use, see `model_wrapper.run_model()` and the `stac` / `stream_session` APIs.
 
-| Argument           | Short      | Default        | Description                                                    |
-| ------------------ | ---------- | -------------- | -------------------------------------------------------------- |
-| `--model_name`     |            | `causalvggt`   | Model variant                                                  |
-| `--base_model`     |            | `stream3r`     | Backbone: `stream3r`, `streamvggt`                             |
-| `--mode`           |            | `full`         | Attention mode ([table](#attention-modes))                     |
-| `--streaming`      |            | off            | Frame-by-frame via StreamSession                               |
-| `--window_size`    | `-win`     | 0              | Sliding KV window (frames)                                     |
-| `--chunk_size`     | `-ck`      | 1              | Frames per forward pass                                        |
-| `--hh_size`        | `-hh`      | 0              | Heavy-hitter frames (H2O)                                      |
-| `--retrieval_size` | `-ret_sz`  | 0              | Voxel pivots per step; `-1` = all                              |
-| `--retrieve_buf`   | `-ret_buf` | off            | Include retrieved pivots in buffer (API: `return_buf=True`)    |
-| `--pinned`         |            | 0              | Frame indices pinned in KV cache                               |
-| `--voxel_size`     |            | 0.05           | Voxel grid resolution (m)                                      |
-| `--voxel_num`      |            | 4096           | Initial voxel pool size                                        |
-| `--voxel_buf_cap`  |            | 8              | Max KV entries per buffer voxel                                |
-| `--voxel_piv_cap`  |            | 4              | Max KV entries per pivot voxel                                 |
-| `--voxel_backend`  |            | cuda (eval)    | `python` or `cuda`; eval scripts default to `cuda`             |
-| `--allocator`      | `-alloc`   | segment (eval) | `static`, `slab`, `segment`; eval scripts default to `segment` |
-| `--temperature`    |            | 0.9            | H2O score temperature                                          |
-| `--size`           |            | 518            | Input resolution                                               |
-| `--kf_every`       |            | 1              | Process every N-th frame                                       |
+<details>
+<summary><span style="font-weight: bold;">Command line arguments (eval scripts)</span></summary>
 
+  #### --model_name
+  Model variant, `causalvggt` by default.
+  #### --base_model
+  Backbone: `stream3r` or `streamvggt`.
+  #### --mode
+  Attention mode; see [Attention modes](#attention-modes). Default: `stac` (recommended preset).
+  #### --streaming
+  Enable frame-by-frame inference via StreamSession (off by default).
+  #### --window_size / -win
+  Sliding KV window size in frames. Default: `0`.
+  #### --chunk_size / -ck
+  Frames per forward pass. Default: `1`.
+  #### --hh_size / -hh
+  Heavy-hitter frames (H2O). Default: `0`.
+  #### --retrieval_size / -ret_sz
+  Voxel pivots per step; `-1` = all. Default: `0`.
+  #### --retrieve_buf / -ret_buf
+  Include retrieved pivots in buffer (API: `return_buf=True`). Off by default.
+  #### --pinned
+  Frame indices pinned in KV cache. Default: `0`.
+  #### --voxel_size
+  Voxel grid resolution in meters. Default: `0.05`.
+  #### --voxel_num
+  Initial voxel pool size. Default: `4096`.
+  #### --voxel_buf_cap
+  Max KV entries per buffer voxel. Default: `8`.
+  #### --voxel_piv_cap
+  Max KV entries per pivot voxel. Default: `4`.
+  #### --voxel_backend
+  `python` or `cuda`; eval scripts default to `cuda`.
+  #### --allocator / -alloc
+  `static`, `slab`, or `segment`; eval scripts default to `segment`.
+  #### --temperature
+  H2O score temperature. Default: `0.9`.
+  #### --size
+  Input resolution. Default: `518`.
+</details>
+<br>
 
 **Env:** `VERBOSE=1` — per-frame KV stats; `MERGER_MEM_PROFILE=1` — CUDA memory fragmentation at cleanup; `ATTN_CUDA=1` — enable attn-cuda backend; `SUBSAMPLE=0.25` — colsum subsampling ratio for attn-cuda path.
 

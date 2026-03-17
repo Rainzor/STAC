@@ -83,7 +83,7 @@ def get_args_parser():
                         help="Tag for saving results under different settings")
     parser.add_argument("--vis_tag", type=str, default=None)
 
-    parser.add_argument("--mode", type=str, default="full",
+    parser.add_argument("--mode", type=str, default="stac",
                         help="Processing mode")
     parser.add_argument("--pose_eval_stride",
                         default=1,
@@ -109,11 +109,15 @@ def get_args_parser():
                         help="Voxel size for VoxelSasa KV cache management")
     parser.add_argument("--voxel_num", type=int, default=4096,
                         help="Initial number of voxels for VoxelSasa KV cache management")
+    parser.add_argument("--voxel_buf_cap", type=int, default=8,
+                        help="Evicted buffer capacity for VoxelSasa KV cache management")
+    parser.add_argument("--voxel_piv_cap", type=int, default=4,
+                        help="Pivot capacity for VoxelSasa KV cache management")
     parser.add_argument("--voxel_backend", type=str, default="cuda",
                         choices=["cuda", "python"],
                         help="Backend type for voxel KV cache management")
     parser.add_argument("--allocator","-alloc", type=str, default="segment",
-                        choices=["static", "slab", "segment", "compact"],
+                        choices=["static", "slab", "segment"],
                         help="Allocator type for VoxelSasa Merge KV cache")
     parser.add_argument("--pinned", type=int, default=[0], nargs="+",
                         help="List of pinned frame indices (default: [0])")
@@ -141,6 +145,8 @@ def run(images, model, dtype, device, args):
         "temperature": args.temperature,
         "voxel_size": args.voxel_size,
         "voxel_num": args.voxel_num,
+        "voxel_buf_cap": args.voxel_buf_cap,
+        "voxel_piv_cap": args.voxel_piv_cap,
         "conf_threshold": args.voxel_conf,
         "voxel_backend": args.voxel_backend,
         "chunk_size": args.chunk_size,
@@ -205,6 +211,8 @@ def run(images, model, dtype, device, args):
             if "merge" in args.mode:
                 model_stats["allocator"] = args.allocator
                 model_stats["return_buf"] = args.retrieve_buf
+                model_stats["voxel_buf_cap"] = args.voxel_buf_cap
+                model_stats["voxel_piv_cap"] = args.voxel_piv_cap
 
     metrics = {
         "model": model_stats,
@@ -216,118 +224,6 @@ def run(images, model, dtype, device, args):
     # Clean up
     torch.cuda.empty_cache()
     return predictions, metrics
-
-
-def visualize_reconstruction(
-    predictions,
-    save_path,
-    conf_thres=3.0,
-    frame_filter="All",
-    mask_black_bg=False,
-    mask_white_bg=False,
-    show_cam=True,
-    mask_sky=False,
-    prediction_mode="Pointmap Regression",
-    tag=None,
-):
-    """
-    Perform reconstruction using the already-created target_dir/images.
-    """
-
-    # Handle None frame_filter
-    if frame_filter is None:
-        frame_filter = "All"
-
-    # Build a GLB file name
-    os.makedirs(save_path, exist_ok=True)
-    if tag is None:
-        glbfile = os.path.join(
-            save_path,
-            f"glbscene_{conf_thres}_{frame_filter.replace('.', '_').replace(':', '').replace(' ', '_')}_maskb{mask_black_bg}_maskw{mask_white_bg}_cam{show_cam}_sky{mask_sky}_pred{prediction_mode.replace(' ', '_')}.glb",
-        )
-    else:
-        glbfile = os.path.join(
-            save_path,
-            f"glbscene_{tag}.glb",
-        )
-
-    # Convert predictions to GLB
-    glbscene = predictions_to_glb(
-        predictions,
-        conf_thres=conf_thres,
-        filter_by_frames=frame_filter,
-        mask_black_bg=mask_black_bg,
-        mask_white_bg=mask_white_bg,
-        show_cam=show_cam,
-        mask_sky=mask_sky,
-        target_dir=save_path,
-        prediction_mode=prediction_mode,
-    )
-    glbscene.export(file_obj=glbfile)
-    logger.info(f"3D reconstruction saved to {glbfile}")
-    return glbfile
-
-def get_ground_truth(batch_data, images):
-    gt_predictions = {}
-    S, C, H, W = images.shape
-    gt_predictions["images"] = images.cpu().numpy()
-    gt_predictions["depth"] = (
-        torch.cat([item["depthmap"] for item in batch_data], dim=0)
-        .unsqueeze(-1)
-        .cpu()
-        .numpy()
-    )
-
-    # Camera poses and intrinsics
-    camera_poses = torch.cat([item["camera_pose"] for item in batch_data], dim=0)
-    camera_intrinsics = torch.cat(
-        [item["camera_intrinsics"] for item in batch_data], dim=0
-    )
-    gt_predictions["camera_pose"] = camera_poses.cpu().numpy()
-    # Convert 4x4 camera poses to 3x4 extrinsics (remove last row)
-    world_to_cam = torch.inverse(camera_poses)
-    gt_predictions["extrinsic"] = world_to_cam[:, :3, :].cpu().numpy()
-
-    gt_predictions["intrinsic"] = camera_intrinsics.cpu().numpy()
-
-    # Get valid masks and 3D points from batch
-    gt_predictions["valid_mask"] = (
-        torch.cat([item["valid_mask"] for item in batch_data], dim=0).cpu().numpy()
-    )
-
-    # Generate confidence maps (set all valid pixels to 1.0)
-    gt_predictions["depth_conf"] = gt_predictions["valid_mask"].astype(np.float32)
-
-    # Generate world points from ground truth depth
-    gt_world_points = unproject_depth_map_to_point_map(
-        gt_predictions["depth"],
-        gt_predictions["extrinsic"],
-        gt_predictions["intrinsic"],
-    )
-    gt_predictions["world_points_from_depth"] = gt_world_points
-    gt_predictions["world_points"] = (
-        torch.cat([item["pts3d"] for item in batch_data], dim=0).cpu().numpy()
-    )
-
-    gt_predictions["world_points_conf"] = (
-        torch.ones((S, H, W), dtype=torch.float32).cpu().numpy()
-    )
-    gt_predictions["pose_enc_list"] = None
-
-    # Generate pose encoding from ground truth extrinsics and intrinsics
-    gt_pose_enc = (
-        extri_intri_to_pose_encoding(
-            torch.from_numpy(gt_predictions["extrinsic"]).unsqueeze(0),
-            torch.from_numpy(gt_predictions["intrinsic"]).unsqueeze(0),
-            image_size_hw=(H, W),
-        )
-        .squeeze(0)
-        .cpu()
-        .numpy()
-    )
-    gt_predictions["pose_enc"] = gt_pose_enc
-
-    return gt_predictions
 
 
 def main(args):

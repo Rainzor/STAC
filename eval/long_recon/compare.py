@@ -162,6 +162,14 @@ def _get_memory(entry: dict) -> dict | None:
     return vc.get("Memory(MB)") or vc.get("memory_details")
 
 
+def _get_num_frames(entry: dict) -> float:
+    """Get scene frame count for weighting; fallback to 1.0 if missing/invalid."""
+    n = entry.get("num_frames")
+    if isinstance(n, (int, float)) and n > 0:
+        return float(n)
+    return 1.0
+
+
 # Backbone-only time: aggregator infer + KV position + retrieval + prune_merge
 BACKBONE_TIME_KEYS = (
     "aggregator_infer_time",
@@ -378,7 +386,7 @@ def _cell_right(s: str, width: int, best_val=None, second_val=None, value=None) 
 
 
 def print_time_memory_tables(runs: dict, scene_filter=None):
-    """Print Time (total, FPS, backbone-only time/FPS) and Memory (total MB, actual MB) per run."""
+    """Print Time/Memory (frame-weighted by num_frames) per run."""
     run_labels = sorted(runs.keys())  # order: model then tag
 
     # Collect per-scene time & mem stats for each run
@@ -398,30 +406,61 @@ def print_time_memory_tables(runs: dict, scene_filter=None):
 
     avg_time = {label: {} for label in run_labels}
     avg_mem = {label: {} for label in run_labels}
+    frame_totals = {label: 0.0 for label in run_labels}
     for label in run_labels:
         data = runs[label]["data"]
-        time_vals = {k: [] for k in time_keys}
-        mem_vals = {k: [] for k in mem_keys}
+        time_weighted_sums = {k: 0.0 for k in time_keys}
+        time_weight_sums = {k: 0.0 for k in time_keys}
+        mem_weighted_sums = {k: 0.0 for k in mem_keys}
+        mem_weight_sums = {k: 0.0 for k in mem_keys}
         for scene in all_scenes:
             entry = data.get(scene)
             if not isinstance(entry, dict):
                 continue
+            scene_weight = _get_num_frames(entry)
+            frame_totals[label] += scene_weight
             t = compute_time_stats(_get_timing(entry))
             if t:
                 for k in time_keys:
-                    time_vals[k].append(t[k])
+                    if t[k] is not None:
+                        time_weighted_sums[k] += t[k] * scene_weight
+                        time_weight_sums[k] += scene_weight
             m = compute_mem_stats(_get_memory(entry))
             if m:
                 for k in mem_keys:
-                    mem_vals[k].append(m[k])
+                    if m[k] is not None:
+                        mem_weighted_sums[k] += m[k] * scene_weight
+                        mem_weight_sums[k] += scene_weight
         for k in time_keys:
-            avg_time[label][k] = sum(time_vals[k]) / len(time_vals[k]) if time_vals[k] else None
+            avg_time[label][k] = (
+                time_weighted_sums[k] / time_weight_sums[k]
+                if time_weight_sums[k] > 0
+                else None
+            )
         for k in mem_keys:
-            avg_mem[label][k] = sum(mem_vals[k]) / len(mem_vals[k]) if mem_vals[k] else None
+            avg_mem[label][k] = (
+                mem_weighted_sums[k] / mem_weight_sums[k]
+                if mem_weight_sums[k] > 0
+                else None
+            )
 
     # Column layout: Run | metric1 | metric2 | ... (same as main table)
     run_col_w = max(6, max(len(l) for l in run_labels))
     num_col_w = 12
+
+    # Frame totals table (for weighted averages)
+    frame_col_name = "Frames(total)"
+    frame_col_w = max(num_col_w, len(frame_col_name))
+    frame_header = "  ".join([f"{'Run':<{run_col_w}}", frame_col_name.ljust(frame_col_w)])
+    frame_sep_len = len(frame_header)
+    print("\n" + "=" * frame_sep_len)
+    print("  FRAME TOTALS used for weighted averaging")
+    print("=" * frame_sep_len)
+    print(frame_header)
+    print("-" * frame_sep_len)
+    for label in run_labels:
+        total_frames = int(round(frame_totals[label]))
+        print(f"{label:<{run_col_w}}  {str(total_frames).rjust(frame_col_w)}")
 
     # Time table: header Run | Total time (ms) | Backbone time (ms); one row per run (lower is better)
     time_rows = [
@@ -433,7 +472,7 @@ def print_time_memory_tables(runs: dict, scene_filter=None):
     time_header = "  ".join(time_header_parts)
     sep_len = len(time_header)
     print("\n" + "=" * sep_len)
-    print("  TIME (ms): total, backbone-only (aggregator_infer + kv_position + kv_retrieval + kv_prune_merge)")
+    print("  TIME (ms): frame-weighted by num_frames; total, backbone-only (aggregator_infer + kv_position + kv_retrieval + kv_prune_merge)")
     print("=" * sep_len)
     print(time_header)
     print("-" * sep_len)
@@ -465,7 +504,7 @@ def print_time_memory_tables(runs: dict, scene_filter=None):
     mem_header = "  ".join(mem_header_parts)
     sep_len = max(sep_len, len(mem_header))
     print("\n" + "=" * sep_len)
-    print("  MEMORY (MB): total_usage; actual = temporal + spatial (attention working set)")
+    print("  MEMORY (MB): frame-weighted by num_frames; total_usage; actual = temporal + spatial (attention working set)")
     print("=" * sep_len)
     print(mem_header)
     print("-" * sep_len)

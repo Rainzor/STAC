@@ -5,8 +5,7 @@ WORKDIR='.'
 OUTPUT_DIR="${WORKDIR}/eval_recon"
 
 MODEL_NAME="causalvggt"
-# base_model: 可由外部覆盖。用法: BASE_MODEL=streamvggt ./run_all.sh  或  ./run_all.sh streamvggt
-BASE_MODEL="streamvggt"
+BASE_MODEL="stream3r"
 KF_EVERY=5
 
 echo "base_model: ${BASE_MODEL}"
@@ -26,8 +25,8 @@ for DATASET in "${DATASETS[@]}"; do
         --base_model "${BASE_MODEL}" \
         --dataset_type "${DATASET}" \
         --save_tag "window" \
-        --vis_tag "win26" \
-        --mode "window_kv" --streaming -win 26
+        --vis_tag "win8" \
+        --mode "window_kv" --streaming -win 8
     
         echo "=========================================="
 

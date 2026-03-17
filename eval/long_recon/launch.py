@@ -80,7 +80,7 @@ def get_args_parser():
                         help="Dataset type to evaluate")
     parser.add_argument("--scene_name", nargs="*", default=[],
                         help="Specific scene(s) to evaluate (default: all)")
-    parser.add_argument("--size", type=int, default=512)
+    parser.add_argument("--size", type=int, default=518)
     parser.add_argument("--kf_every", type=int, default=1,
                         help="Keyframe interval")
     parser.add_argument("--num_frames", type=int, default=-1,
@@ -89,7 +89,7 @@ def get_args_parser():
                         help="Starting frame index (NRGBD only)")
 
     # inference mode
-    parser.add_argument("--mode", type=str, default="full",
+    parser.add_argument("--mode", type=str, default="stac",
                         help="Processing mode")
     parser.add_argument("--streaming", action="store_true",
                         help="Use streaming mode")
@@ -257,7 +257,7 @@ def _depth_metric(depth_metrics, *candidate_keys):
     return float("nan")
 
 def main(args):
-    if args.size == 518:  # keep (518, 392) aligned with STream3R
+    if args.size == 518:  # keep (518, 392) aligned with SparseVGGT for same token count / memory
         resolution = (518, 392)
     elif args.size == 512:
         resolution = (512, 384)
@@ -333,21 +333,9 @@ def main(args):
             basic_metrics["dataset"] = args.dataset_type
             basic_metrics["scene"]   = scene_name
             basic_metrics["kf_every"] = args.kf_every
-
             batch = default_collate([dataset[name_idx]])
-
-            ignore_keys = {"dataset", "label", "depthmap", "instance", "idx", "true_shape", "rng"}
-            for view in batch:
-                for name in view.keys():
-                    if name in ignore_keys:
-                        continue
-                    if isinstance(view[name], (tuple, list)):
-                        view[name] = [x.to(device, non_blocking=True) for x in view[name]]
-                    else:
-                        view[name] = view[name].to(device, non_blocking=True)
-
             images = torch.cat([item['img'] for item in batch])
-            images = ImgDust3r2Stream3r(images).to(device)
+            images = ImgDust3r2Stream3r(images)
 
             basic_metrics["num_frames"] = images.shape[0]
             predictions, model_metrics = run(images, model, dtype, device, args)

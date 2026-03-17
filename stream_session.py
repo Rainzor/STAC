@@ -279,6 +279,7 @@ class StreamSession:
             # Use H2O attention to maintain a heavy-hitter + recent KV cache for the aggregator.
             window_size = kwargs.get("window_size", 0)
             chunk_size = kwargs.get("chunk_size", 1)
+            transfer_chunk_size = kwargs.get("transfer_chunk_size", max(chunk_size, 16))
             if mode == "causal":
                 window_size = num_frames
             if window_size < 0:
@@ -286,6 +287,12 @@ class StreamSession:
                 window_size = num_frames  # effectively causal
             if chunk_size < 1:
                 raise ValueError(f"chunk_size must be >= 1, got {chunk_size}.")
+            if transfer_chunk_size < chunk_size:
+                logger.warning(
+                    "transfer_chunk_size (%d) < chunk_size (%d), clamping to chunk_size.",
+                    transfer_chunk_size, chunk_size,
+                )
+                transfer_chunk_size = chunk_size
             if window_size > 0 and chunk_size > window_size:
                 logger.warning(
                     f"chunk_size ({chunk_size}) > window_size ({window_size}): "
@@ -300,54 +307,67 @@ class StreamSession:
             kv_kwargs = self.register_kv_mgr(mode, images, KVManager, **kv_kwargs)
             self.model.set_camhead(self.cam_cache_update)
             debug_timing = kwargs.get("timing", True)
+            logger.info("Window mode: chunk=%d, transfer_chunk=%d, window=%d",
+                        chunk_size, transfer_chunk_size, window_size)
             progress, task = _make_progress("Window Mode", num_frames)
             with Live(progress, console=_console, refresh_per_second=8) as live:
-                for frame_idx in range(0, num_frames, chunk_size):
-                    frame_buffer = images[frame_idx : min(frame_idx + chunk_size, num_frames)].to(device=self.device)
-                    frame_buffer_size = frame_buffer.shape[0]
-                    outputs = self.model(
-                        images=frame_buffer,
-                        mode="full",
-                        camera_head_kv_cache_list=None,
-                        streaming=True,
-                        is_anchor_exist=frame_idx == 0,
-                        timing=debug_timing,
+                for transfer_start in range(0, num_frames, transfer_chunk_size):
+                    transfer_end = min(transfer_start + transfer_chunk_size, num_frames)
+                    transfer_chunk = images[transfer_start:transfer_end].to(
+                        device=self.device, non_blocking=True
                     )
-                    timing = outputs.get("timing", {})
-                    if not self.cam_cache_update and self.model.camera_head is not None:
-                        self.camera_head_inference(outputs["aggregated_tokens_list"])
-                    
-                    prune_time = self.model.aggregator.prune_kv_mgr(timing=debug_timing)
-                    timing["kv_pruning_time"] = prune_time
+                    transfer_count = transfer_chunk.shape[0]
 
-                    self.pushback_prediction(outputs)
-                    self._update_benchmark(outputs.get("timing", {}))
+                    for local_offset in range(0, transfer_count, chunk_size):
+                        frame_idx = transfer_start + local_offset
+                        local_end = min(local_offset + chunk_size, transfer_count)
+                        frame_buffer = transfer_chunk[local_offset:local_end]
+                        frame_buffer_size = frame_buffer.shape[0]
+                        outputs = self.model(
+                            images=frame_buffer,
+                            mode="full",
+                            camera_head_kv_cache_list=None,
+                            streaming=True,
+                            is_anchor_exist=frame_idx == 0,
+                            timing=debug_timing,
+                        )
+                        timing = outputs.get("timing", {})
+                        if not self.cam_cache_update and self.model.camera_head is not None:
+                            self.camera_head_inference(outputs["aggregated_tokens_list"])
+                        
+                        prune_time = self.model.aggregator.prune_kv_mgr(timing=debug_timing)
+                        timing["kv_pruning_time"] = prune_time
 
-                    kvcache_info = self.model.aggregator.get_kv_mgr_info()
-                    kvcache_size = kvcache_info["kvcache_size"][0]
-                    kvcache_mem = kvcache_info["kvcache_used"]
-                    # When CPU offload is active, show total (gpu+cpu) so stats reflect full context
-                    if "kvcache_size_total" in kvcache_info:
-                        total_tok = kvcache_info["kvcache_size_total"][0]
-                        total_mem = kvcache_info["kvcache_used_total"]
-                        cache_str = f"tokens={total_tok} (gpu {kvcache_size})  mem={total_mem:.0f}MB (gpu {kvcache_mem:.0f}MB)"
-                    else:
-                        cache_str = f"tokens={kvcache_size}  mem={kvcache_mem:.0f}MB"
+                        self.pushback_prediction(outputs)
+                        self._update_benchmark(outputs.get("timing", {}))
 
-                    agg_time = timing.get("aggregator_infer_time", 0) / frame_buffer_size
-                    prune_time = timing.get("kv_pruning_time", 0) / frame_buffer_size
-                    allocated, reserved = _gpu_mem_mb()
+                        kvcache_info = self.model.aggregator.get_kv_mgr_info()
+                        kvcache_size = kvcache_info["kvcache_size"][0]
+                        kvcache_mem = kvcache_info["kvcache_used"]
+                        # When CPU offload is active, show total (gpu+cpu) so stats reflect full context
+                        if "kvcache_size_total" in kvcache_info:
+                            total_tok = kvcache_info["kvcache_size_total"][0]
+                            total_mem = kvcache_info["kvcache_used_total"]
+                            cache_str = f"tokens={total_tok} (gpu {kvcache_size})  mem={total_mem:.0f}MB (gpu {kvcache_mem:.0f}MB)"
+                        else:
+                            cache_str = f"tokens={kvcache_size}  mem={kvcache_mem:.0f}MB"
 
-                    progress.update(task, advance=frame_buffer_size)
-                    live.update(Group(
-                        progress,
-                        _stats_table([
-                            ("Time(ms)", f"agg={agg_time:.1f}  prune={prune_time:.1f}"),
-                            ("KV Cache", cache_str),
-                            ("GPU(MB)", f"alloc={allocated:.0f}  reserved={reserved:.0f}"),
-                        ]),
-                    ))
-                    self._processed_frames += frame_buffer_size
+                        agg_time = timing.get("aggregator_infer_time", 0) / frame_buffer_size
+                        prune_time = timing.get("kv_pruning_time", 0) / frame_buffer_size
+                        allocated, reserved = _gpu_mem_mb()
+
+                        progress.update(task, advance=frame_buffer_size)
+                        live.update(Group(
+                            progress,
+                            _stats_table([
+                                ("Time(ms)", f"agg={agg_time:.1f}  prune={prune_time:.1f}"),
+                                ("KV Cache", cache_str),
+                                ("GPU(MB)", f"alloc={allocated:.0f}  reserved={reserved:.0f}"),
+                            ]),
+                        ))
+                        self._processed_frames += frame_buffer_size
+
+                    del transfer_chunk
             if VERBOSE:
                 logger.info("Window mode done.")
             # Token stats are not meaningful for our kv_manager; keep Token empty. Persist Memory(MB) for eval/compare.
@@ -408,113 +428,131 @@ class StreamSession:
             self.model.set_camhead(self.cam_cache_update)
 
             conf_threshold = kwargs.get("conf_threshold", 2.0)
-            logger.info("STAC chunk-merge: chunk=%d, window=%d, conf_threshold=%.1f",
-                        chunk_size, window_size, conf_threshold)
+            transfer_chunk_size = kwargs.get("transfer_chunk_size", max(chunk_size, 16))
+            if transfer_chunk_size < chunk_size:
+                logger.warning(
+                    "transfer_chunk_size (%d) < chunk_size (%d), clamping to chunk_size.",
+                    transfer_chunk_size, chunk_size,
+                )
+                transfer_chunk_size = chunk_size
+            logger.info("STAC chunk-merge: chunk=%d, transfer_chunk=%d, window=%d, conf_threshold=%.1f",
+                        chunk_size, transfer_chunk_size, window_size, conf_threshold)
             special_tokens_size = self.model.aggregator.patch_start_idx
             
             progress, task = _make_progress("STAC Mode", num_frames)
             with Live(progress, console=_console, refresh_per_second=8) as live:
-                for frame_idx in range(0, num_frames, chunk_size):
-                    frame_buffer = images[frame_idx : min(frame_idx + chunk_size, num_frames)].to(device=self.device)
-                    frame_buffer_size = frame_buffer.shape[0]
-                    outputs = self.model(
-                        images=frame_buffer,
-                        mode="full",
-                        camera_head_kv_cache_list=None,
-                        streaming=True,
-                        is_anchor_exist=frame_idx==0,
-                        timing=debug_timing,
+                for transfer_start in range(0, num_frames, transfer_chunk_size):
+                    transfer_end = min(transfer_start + transfer_chunk_size, num_frames)
+                    transfer_chunk = images[transfer_start:transfer_end].to(
+                        device=self.device, non_blocking=True
                     )
-                    timing = outputs.get("timing", {})
-                    if not self.cam_cache_update and self.model.camera_head is not None:
-                        cam_output = self.camera_head_inference(outputs["aggregated_tokens_list"])
-                        pose_enc = cam_output["pose_enc"]
-                    else:
-                        pose_enc = outputs["pose_enc"]
+                    transfer_count = transfer_chunk.shape[0]
 
-                    pts3d, valid_mask = self.get_pointmap(outputs, conf_threshold=conf_threshold, 
-                                                          special_tokens_size=special_tokens_size,
-                                                          pose_enc = pose_enc, images=frame_buffer
-                                                          )
-                    kv_pos_time = self.model.aggregator.update_kv_mgr_pos(pts3d, valid_mask, timing=debug_timing)
-                    timing["kv_position_time"] = kv_pos_time
+                    for local_offset in range(0, transfer_count, chunk_size):
+                        frame_idx = transfer_start + local_offset
+                        local_end = min(local_offset + chunk_size, transfer_count)
+                        frame_buffer = transfer_chunk[local_offset:local_end]
+                        frame_buffer_size = frame_buffer.shape[0]
+                        outputs = self.model(
+                            images=frame_buffer,
+                            mode="full",
+                            camera_head_kv_cache_list=None,
+                            streaming=True,
+                            is_anchor_exist=frame_idx==0,
+                            timing=debug_timing,
+                        )
+                        timing = outputs.get("timing", {})
+                        if not self.cam_cache_update and self.model.camera_head is not None:
+                            cam_output = self.camera_head_inference(outputs["aggregated_tokens_list"])
+                            pose_enc = cam_output["pose_enc"]
+                        else:
+                            pose_enc = outputs["pose_enc"]
 
-                    retrieval_time = 0.0
-                    if frame_idx > max(buffer_size, 16):
-                        if ret_size > 0:
-                            chunks_per_window = max(1, window_size // chunk_size)
-                            if (frame_idx // chunk_size + 1) % chunks_per_window == 0:
+                        pts3d, valid_mask = self.get_pointmap(outputs, conf_threshold=conf_threshold, 
+                                                              special_tokens_size=special_tokens_size,
+                                                              pose_enc = pose_enc, images=frame_buffer
+                                                              )
+                        kv_pos_time = self.model.aggregator.update_kv_mgr_pos(pts3d, valid_mask, timing=debug_timing)
+                        timing["kv_position_time"] = kv_pos_time
+
+                        retrieval_time = 0.0
+                        if frame_idx > max(buffer_size, 16):
+                            if ret_size > 0:
+                                chunks_per_window = max(1, window_size // chunk_size)
+                                if (frame_idx // chunk_size + 1) % chunks_per_window == 0:
+                                    retrieval_time = self.model.aggregator.retrieve_kv_mgr(timing=debug_timing, verbose=False,
+                                                                                           dist_thres=dist_thres,
+                                                                                           return_buf=kwargs.get("return_buf", False))
+                            elif ret_size == -1:
                                 retrieval_time = self.model.aggregator.retrieve_kv_mgr(timing=debug_timing, verbose=False,
                                                                                        dist_thres=dist_thres,
                                                                                        return_buf=kwargs.get("return_buf", False))
-                        elif ret_size == -1:
-                            retrieval_time = self.model.aggregator.retrieve_kv_mgr(timing=debug_timing, verbose=False,
-                                                                                   dist_thres=dist_thres,
-                                                                                   return_buf=kwargs.get("return_buf", False))
 
-                    timing["kv_retrieval_time"] = retrieval_time
+                        timing["kv_retrieval_time"] = retrieval_time
 
-                    evict_merge_time = self.model.aggregator.prune_kv_mgr(timing=debug_timing)
-                    timing["kv_evict_merge_time"] = evict_merge_time
+                        evict_merge_time = self.model.aggregator.prune_kv_mgr(timing=debug_timing)
+                        timing["kv_evict_merge_time"] = evict_merge_time
 
-                    if frame_idx % (chunk_size * 4) == 0 or frame_idx >= num_frames - chunk_size:
-                        _mem_profile = os.environ.get("MERGER_MEM_PROFILE", "0") == "1"
-                        if _mem_profile:
-                            torch.cuda.synchronize()
-                            a_before = torch.cuda.memory_allocated() / (1024**2)
-                            r_before = torch.cuda.memory_reserved() / (1024**2)
-                            frag_before = r_before - a_before
-                        torch.cuda.empty_cache()
-                        if _mem_profile:
-                            r_after = torch.cuda.memory_reserved() / (1024**2)
-                            frag_after = r_after - a_before
-                            freed = r_before - r_after
-                            logger.debug(
-                                "  [MEM-FRAG] frame=%d | alloc=%.0fMB, "
-                                "res_before=%.0fMB, res_after=%.0fMB, "
-                                "frag_before=%.0fMB, frag_after=%.0fMB, "
-                                "freed_by_empty_cache=%.0fMB",
-                                frame_idx, a_before, r_before, r_after,
-                                frag_before, frag_after, freed,
-                            )
+                        if frame_idx % (chunk_size * 4) == 0 or frame_idx >= num_frames - chunk_size:
+                            _mem_profile = os.environ.get("MERGER_MEM_PROFILE", "0") == "1"
+                            if _mem_profile:
+                                torch.cuda.synchronize()
+                                a_before = torch.cuda.memory_allocated() / (1024**2)
+                                r_before = torch.cuda.memory_reserved() / (1024**2)
+                                frag_before = r_before - a_before
+                            torch.cuda.empty_cache()
+                            if _mem_profile:
+                                r_after = torch.cuda.memory_reserved() / (1024**2)
+                                frag_after = r_after - a_before
+                                freed = r_before - r_after
+                                logger.debug(
+                                    "  [MEM-FRAG] frame=%d | alloc=%.0fMB, "
+                                    "res_before=%.0fMB, res_after=%.0fMB, "
+                                    "frag_before=%.0fMB, frag_after=%.0fMB, "
+                                    "freed_by_empty_cache=%.0fMB",
+                                    frame_idx, a_before, r_before, r_after,
+                                    frag_before, frag_after, freed,
+                                )
 
-                    self.pushback_prediction(outputs)
-                    self._update_benchmark(timing)
+                        self.pushback_prediction(outputs)
+                        self._update_benchmark(timing)
 
-                    kvcache_info = self.model.aggregator.get_kv_mgr_info()
-                    merger_stat = kv_manager.get_merger_info()
-                    merger_stat["frame_idx"] = frame_idx
-                    total_time = 0.0
-                    for key, value in timing.items():
-                        merger_stat[key] = value / frame_buffer_size
-                        total_time += value
-                    merger_stat["total_time"] = total_time / frame_buffer_size
+                        kvcache_info = self.model.aggregator.get_kv_mgr_info()
+                        merger_stat = kv_manager.get_merger_info()
+                        merger_stat["frame_idx"] = frame_idx
+                        total_time = 0.0
+                        for key, value in timing.items():
+                            merger_stat[key] = value / frame_buffer_size
+                            total_time += value
+                        merger_stat["total_time"] = total_time / frame_buffer_size
 
-                    allocated, reserved = _gpu_mem_mb()
+                        allocated, reserved = _gpu_mem_mb()
 
-                    agg_t = timing.get("aggregator_infer_time", 0) / frame_buffer_size
-                    pos_t = kv_pos_time / frame_buffer_size
-                    mrg_t = evict_merge_time / frame_buffer_size
-                    ret_t = retrieval_time / frame_buffer_size
+                        agg_t = timing.get("aggregator_infer_time", 0) / frame_buffer_size
+                        pos_t = kv_pos_time / frame_buffer_size
+                        mrg_t = evict_merge_time / frame_buffer_size
+                        ret_t = retrieval_time / frame_buffer_size
 
-                    mem_details = kv_manager.get_memory_details()
-                    temporal_mem   = mem_details.get("temporal_cache_usage", 0)
-                    vox_used  = (mem_details.get("voxel_buffer_usage", 0)
-                                 + mem_details.get("voxel_pivot_usage", 0))
-                    vox_alloc = (mem_details.get("voxel_buffer_alloc", 0)
-                                 + mem_details.get("voxel_pivot_alloc", 0))
-                    spatial_mem   = mem_details.get("spatial_cache_usage", 0)
+                        mem_details = kv_manager.get_memory_details()
+                        temporal_mem   = mem_details.get("temporal_cache_usage", 0)
+                        vox_used  = (mem_details.get("voxel_buffer_usage", 0)
+                                     + mem_details.get("voxel_pivot_usage", 0))
+                        vox_alloc = (mem_details.get("voxel_buffer_alloc", 0)
+                                     + mem_details.get("voxel_pivot_alloc", 0))
+                        spatial_mem   = mem_details.get("spatial_cache_usage", 0)
 
-                    progress.update(task, advance=frame_buffer_size)
-                    live.update(Group(
-                        progress,
-                        _stats_table([
-                            ("Time(ms)", f"agg={agg_t:.1f} | ret={ret_t:.1f} | pos={pos_t:.1f} | evict&merge={mrg_t:.1f}"),
-                            ("Cache(MB)", f"temporal={temporal_mem:.0f} | spatial(retrieval)={spatial_mem:.0f} |  voxel(used/alloc)={vox_used:.0f}/{vox_alloc:.0f}  "),
-                            ("GPU(MB)", f"allocated={allocated:.0f} | reserved={reserved:.0f}"),
-                        ]),
-                    ))
-                    self._processed_frames += frame_buffer_size
+                        progress.update(task, advance=frame_buffer_size)
+                        live.update(Group(
+                            progress,
+                            _stats_table([
+                                ("Time(ms)", f"agg={agg_t:.1f} | ret={ret_t:.1f} | pos={pos_t:.1f} | evict&merge={mrg_t:.1f}"),
+                                ("Cache(MB)", f"temporal={temporal_mem:.0f} | spatial(retrieval)={spatial_mem:.0f} |  voxel(used/alloc)={vox_used:.0f}/{vox_alloc:.0f}  "),
+                                ("GPU(MB)", f"allocated={allocated:.0f} | reserved={reserved:.0f}"),
+                            ]),
+                        ))
+                        self._processed_frames += frame_buffer_size
+
+                    del transfer_chunk
             if VERBOSE:
                 logger.info("STAC chunk-merge mode done.")
 

@@ -4,16 +4,31 @@ set -e
 WORKDIR='.'
 OUTPUT_DIR="${WORKDIR}/eval_recon"
 
-MODEL_NAME="causalvggt"
-BASE_MODEL="stream3r"
-KF_EVERY=5
+# External overrides (examples):
+#   BASE_MODEL=streamvggt MODE=stac ATTN_CUDA=1 bash eval/long_recon/run.sh
+MODEL_NAME="${MODEL_NAME:-causalvggt}"
+BASE_MODEL="${BASE_MODEL:-stream3r}"
+MODE="${MODE:-stac}"
+KF_EVERY="${KF_EVERY:-5}"
+ATTN_CUDA="${ATTN_CUDA:-0}"
+SUBSAMPLE="${SUBSAMPLE:-1.0}"
 
 DATASETS=("NRGBD" "7scenes")
+
+# Auto tag by backend mode (override by VIS_TAG=...)
+if [[ "${ATTN_CUDA}" == "1" ]]; then
+    AUTO_VIS_TAG="attn_cuda_sub${SUBSAMPLE}"
+else
+    AUTO_VIS_TAG="attn_triton"
+fi
+VIS_TAG="${VIS_TAG:-${AUTO_VIS_TAG}}"
 
 for DATASET in "${DATASETS[@]}"; do
     echo "=========================================="
     echo "Evaluating dataset: ${DATASET}"
+    echo "MODEL_NAME=${MODEL_NAME} BASE_MODEL=${BASE_MODEL} MODE=${MODE} ATTN_CUDA=${ATTN_CUDA} SUBSAMPLE=${SUBSAMPLE} VIS_TAG=${VIS_TAG}"
     echo "=========================================="
+    ATTN_CUDA="${ATTN_CUDA}" SUBSAMPLE="${SUBSAMPLE}" \
     python eval/long_recon/launch.py \
         --output_dir "${OUTPUT_DIR}" \
         --size 518 \
@@ -22,6 +37,6 @@ for DATASET in "${DATASETS[@]}"; do
         --base_model "${BASE_MODEL}" \
         --dataset_type "${DATASET}" \
         --save_tag "stac" \
-        --vis_tag "cuda" \
-        --mode stac
+        --vis_tag "${VIS_TAG}" \
+        --mode "${MODE}"
 done

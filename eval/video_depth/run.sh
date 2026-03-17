@@ -5,7 +5,7 @@ workdir='.'
 
 default_datasets=('bonn' 'sintel' 'kitti')
 datasets=("${@:-${default_datasets[@]}}")
-base_models=('stream3r' 'streamvggt')
+base_models=('stream3r')
 output_dir="${workdir}/eval_depth/video_depth"
 
 for model in "${base_models[@]}"; do
