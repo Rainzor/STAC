@@ -3,11 +3,16 @@ from scipy.spatial import cKDTree as KDTree
 import torch
 from scipy.spatial.transform import Rotation
 from scipy.optimize import minimize
+import os
+try:
+    import faiss
+except Exception:
+    faiss = None
 
 
 def accuracy(gt_points, rec_points, gt_normals=None, rec_normals=None):
     gt_points_kd_tree = KDTree(gt_points)
-    distances, idx = gt_points_kd_tree.query(rec_points, workers=8)
+    distances, idx = gt_points_kd_tree.query(rec_points, workers=min(8, os.cpu_count() // 2))
     acc = np.mean(distances)
     acc_median = np.median(distances)
     if gt_normals is not None and rec_normals is not None:
@@ -19,7 +24,86 @@ def accuracy(gt_points, rec_points, gt_normals=None, rec_normals=None):
 
 def completion(gt_points, rec_points, gt_normals=None, rec_normals=None):
     gt_points_kd_tree = KDTree(rec_points)
-    distances, idx = gt_points_kd_tree.query(gt_points, workers=8)
+    distances, idx = gt_points_kd_tree.query(gt_points, workers=min(8, os.cpu_count() // 2))
+    comp = np.mean(distances)
+    comp_median = np.median(distances)
+    if gt_normals is not None and rec_normals is not None:
+        normal_dot = np.sum(gt_normals * rec_normals[idx], axis=-1)
+        normal_dot = np.abs(normal_dot)
+        return comp, comp_median, np.mean(normal_dot), np.median(normal_dot)
+    return comp, comp_median
+
+
+def _sanitize_points(points, normals=None):
+    points = np.asarray(points)
+    finite_mask = np.isfinite(points).all(axis=1)
+    points = points[finite_mask]
+    if normals is not None:
+        normals = np.asarray(normals)[finite_mask]
+    return points, normals
+
+
+def _faiss_1nn(query_points, ref_points, gpu_id=0):
+    if faiss is None:
+        raise ImportError("faiss is not installed")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available")
+
+    query = np.ascontiguousarray(query_points.astype(np.float32))
+    ref = np.ascontiguousarray(ref_points.astype(np.float32))
+
+    index_cpu = faiss.IndexFlatL2(3)
+    res = faiss.StandardGpuResources()
+    index_gpu = faiss.index_cpu_to_gpu(res, gpu_id, index_cpu)
+    index_gpu.add(ref)
+    d2, idx = index_gpu.search(query, 1)
+    distances = np.sqrt(np.maximum(d2[:, 0], 0.0)).astype(np.float64)
+    return distances, idx[:, 0].astype(np.int64)
+
+
+def accuracy_gpu(
+    gt_points,
+    rec_points,
+    gt_normals=None,
+    rec_normals=None,
+    gpu_id=0,
+):
+    gt_points, gt_normals = _sanitize_points(gt_points, gt_normals)
+    rec_points, rec_normals = _sanitize_points(rec_points, rec_normals)
+
+    if gt_points.shape[0] == 0 or rec_points.shape[0] == 0:
+        if gt_normals is not None and rec_normals is not None:
+            return np.nan, np.nan, np.nan, np.nan
+        return np.nan, np.nan
+
+    distances, idx = _faiss_1nn(rec_points, gt_points, gpu_id=gpu_id)
+
+    acc = np.mean(distances)
+    acc_median = np.median(distances)
+    if gt_normals is not None and rec_normals is not None:
+        normal_dot = np.sum(gt_normals[idx] * rec_normals, axis=-1)
+        normal_dot = np.abs(normal_dot)
+        return acc, acc_median, np.mean(normal_dot), np.median(normal_dot)
+    return acc, acc_median
+
+
+def completion_gpu(
+    gt_points,
+    rec_points,
+    gt_normals=None,
+    rec_normals=None,
+    gpu_id=0,
+):
+    gt_points, gt_normals = _sanitize_points(gt_points, gt_normals)
+    rec_points, rec_normals = _sanitize_points(rec_points, rec_normals)
+
+    if gt_points.shape[0] == 0 or rec_points.shape[0] == 0:
+        if gt_normals is not None and rec_normals is not None:
+            return np.nan, np.nan, np.nan, np.nan
+        return np.nan, np.nan
+
+    distances, idx = _faiss_1nn(gt_points, rec_points, gpu_id=gpu_id)
+
     comp = np.mean(distances)
     comp_median = np.median(distances)
     if gt_normals is not None and rec_normals is not None:
