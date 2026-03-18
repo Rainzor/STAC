@@ -45,13 +45,13 @@ Feed-forward 3D models ([STream3R](https://github.com/NIRVANALAN/STream3R), [Str
 - **Memory-constrained** — working temporal cache + long-term voxel merge keep KV growth bounded over long streams.
 - **Efficient inference** — chunk-based StreamSession and optional CUDA (merger + attn) for stable latency and higher throughput.
 
-## 📁 Code Structure
+### Code Structure
 
 ```text
 STAC/
 ├── main.py                    # Minimal inference entry point
 ├── model_wrapper.py           # load_model() / run_model() API
-├── stream_session.py          # Frame-by-frame streaming session
+├── stream_session.py          # Chunk-by-chunk streaming session
 ├── requirements.txt
 ├── stac/                      # STAC KV-cache compression (plug-and-play)
 │   ├── kv_manager.py          #   Sliding window + H2O token selection
