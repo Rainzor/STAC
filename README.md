@@ -23,21 +23,28 @@
 | Long-video support | ✗ (OOM)        | ✓ (no history)    | ✓ (with spatial memory)   |
 
 
+<p align="center">
+  <img src="assets/attn_map.jpg" width="70%" alt="Attention map: Window vs STAC" />
+</p>
+<p align="center"><em>Attention pattern: Window (local only) vs. STAC (selective long-range retrieval with bounded cache).</em></p>
+
+
 **Supported backbones** (switch via `--base_model`): [STream3R](https://github.com/NIRVANALAN/STream3R) (`stream3r`) · [StreamVGGT](https://github.com/wzzheng/StreamVGGT) (`streamvggt`)
 
 ## Overview
 
 Feed-forward 3D models ([STream3R](https://github.com/NIRVANALAN/STream3R), [StreamVGGT](https://github.com/wzzheng/StreamVGGT)) scale poorly on long videos (O(N²) memory); sliding-window attention avoids OOM but loses history. **STAC** merges evicted tokens into a 3D voxel pool by world coordinates and retrieves the most relevant *pivot* tokens at each step, keeping long-range spatial memory with bounded memory and compute.
 
+<p align="center">
+  <img src="assets/overview.jpg" width="85%" alt="STAC overview" />
+</p>
+<p align="center"><em>Overview: STAC with Causal-VGGT (left) and runtime–memory scaling vs. baseline (right).</em></p>
+
 ### Key features
 
-- **Plug-and-play** — any causal ViT backbone via `--base_model`; no code changes to switch.
-- **Voxel KV merging** — evicted KV pairs merged into 3D voxels by world position; bounded memory.
-- **On-demand pivot retrieval** — attention-score–guided selection of historical tokens per step.
-- **H2O heavy-hitter selection** — keeps high-attention tokens in cache for quality.
-- **Optional CUDA merger** — `--voxel_backend cuda` for faster merging (build `merger-cuda`).
-- **Optional CUDA attention extension** — `attn-cuda` provides a custom FlashAttention forward (+ optional bias + colsum) backend used by STAC decoding.
-- **StreamSession** — frame-by-frame inference with prediction accumulation.
+- **Plug-and-play** — switch backbones via `--base_model`; no code changes.
+- **Memory-constrained** — working temporal cache + long-term voxel merge keep KV growth bounded over long streams.
+- **Efficient inference** — chunk-based StreamSession and optional CUDA (merger + attn) for stable latency and higher throughput.
 
 ## Installation
 
