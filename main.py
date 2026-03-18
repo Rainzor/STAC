@@ -44,8 +44,21 @@ def parse_args():
     parser.add_argument("--window_size", "-win", type=int, default=0)
     parser.add_argument("--chunk_size", "-ck", type=int, default=1)
     parser.add_argument("--hh_size", "-hh", type=int, default=0)
+    parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "fp16", "bf16"])
+    parser.add_argument("--attn_backend", type=str, default="cuda", choices=["cuda", "triton"])
+    parser.add_argument("--subsample", type=float, default=1.0)
+    parser.add_argument("--pinned", type=int, default=0, nargs="+")
+    parser.add_argument("--temperature", type=float, default=0.9)
     parser.add_argument("--retrieval_size", "-ret_sz", type=int, default=0)
     parser.add_argument("--retrieve_buf", "-ret_buf", action="store_true")
+    parser.add_argument("--voxel_size", type=float, default=0.05)
+    parser.add_argument("--voxel_num", type=int, default=4096)
+    parser.add_argument("--voxel_conf", type=float, default=2.0)
+    parser.add_argument("--voxel_buf_cap", type=int, default=8)
+    parser.add_argument("--voxel_piv_cap", type=int, default=4)
+    parser.add_argument("--voxel_backend", type=str, default="cuda", choices=["cuda", "python"])
+    parser.add_argument("--allocator", "-alloc", type=str, default="segment", choices=["static", "slab", "segment"])
+
     return parser.parse_args()
 
 
@@ -83,7 +96,13 @@ def load_scene_images(scene_dir, size=518):
 def main():
     args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+
+    if args.dtype == "bf16":
+        dtype = torch.bfloat16
+    elif args.dtype == "fp16":
+        dtype = torch.float16
+    else:
+        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
     # 1. Load model
     model = load_model("causalvggt", base_model=args.base_model, device=device)
@@ -99,6 +118,17 @@ def main():
         "hh_size": args.hh_size,
         "retrieval_size": args.retrieval_size,
         "return_buf": args.retrieve_buf,
+        "temperature": args.temperature,
+        "attn_backend": args.attn_backend,
+        "subsample_ratio": args.subsample,
+        "pinned_frame_indices": args.pinned,
+        "voxel_size": args.voxel_size,
+        "voxel_num": args.voxel_num,
+        "conf_threshold": args.voxel_conf,
+        "voxel_buf_cap": args.voxel_buf_cap,
+        "voxel_piv_cap": args.voxel_piv_cap,
+        "voxel_backend": args.voxel_backend,
+        "allocator": args.allocator,
     }
     with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=dtype):
         predictions = run_model(
