@@ -2,16 +2,25 @@
 
 **STAC** is a **plug-and-play** KV-cache module for memory-efficient streaming 3D reconstruction over long videos. It compresses evicted KV-cache tokens into a 3D voxel pool and retrieves them on demand — compatible with any causal vision transformer backbone.
 
-- [Overview](#overview)
-- [Installation](#installation)
-- [Checkpoints and Datasets Preparation](#checkpoints-and-datasets-preparation)
-- [Quick Start](#quick-start)
-- [Demos](#demos)
-- [Evaluation](#evaluation)
-- [Key arguments](#key-arguments)
-- [Architecture](#architecture)
-- [Project structure](#project-structure)
-- [Citation](#citation)
+- [STAC: Sparse Token Attention Cache for Streaming 3D Reconstruction](#stac-sparse-token-attention-cache-for-streaming-3d-reconstruction)
+  - [Overview](#overview)
+    - [Key features](#key-features)
+  - [Installation](#installation)
+    - [CUDA KV merger (`merger-cuda`)](#cuda-kv-merger-merger-cuda)
+    - [CUDA attention extension (`attn-cuda`)](#cuda-attention-extension-attn-cuda)
+  - [Checkpoints and Datasets Preparation](#checkpoints-and-datasets-preparation)
+  - [Quick Start](#quick-start)
+    - [Python API](#python-api)
+    - [Command line](#command-line)
+  - [Demos](#demos)
+  - [Evaluation](#evaluation)
+  - [Key arguments](#key-arguments)
+  - [Architecture](#architecture)
+    - [Attention modes](#attention-modes)
+  - [Project structure](#project-structure)
+  - [Citation](#citation)
+  - [Acknowledgments](#acknowledgments)
+  - [License](#license)
 
 ---
 
@@ -220,102 +229,97 @@ python eval/long_recon/launch.py --output_dir eval_recon
 Use `--base_model` to switch backbones. Batch run:
 
 
-| Task              | Batch script                                         | Single-run entry                                                               |
-| ----------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------ |
-| 3D reconstruction | `[eval/long_recon/run.sh](eval/long_recon/run.sh)`   | `eval/long_recon/launch.py` (e.g. `--dataset_type NRGBD --scene_name complete_kitchen`)                      |
-| Camera pose       | `[eval/cam_pose/run.sh](eval/cam_pose/run.sh)`       | `eval/cam_pose/launch.py` (e.g. `--dataset_type tum`)                          |
-| Video depth       | `[eval/video_depth/run.sh](eval/video_depth/run.sh)` | `eval/video_depth/launch.py` && `eval/video_depth/eval_depth.py --align scale` |
+| Task              | Batch script                                       | Single-run entry                                                                                                          |
+| ----------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| 3D reconstruction | [eval/long_recon/run.sh](eval/long_recon/run.sh)   | [eval/long_recon/launch.py](eval/long_recon/launch.py) (e.g. `--dataset_type NRGBD --scene_name complete_kitchen`)     |
+| Camera pose       | [eval/cam_pose/run.sh](eval/cam_pose/run.sh)       | [eval/cam_pose/launch.py](eval/cam_pose/launch.py) (e.g. `--dataset_type tum`)                                           |
+| Video depth       | [eval/video_depth/run.sh](eval/video_depth/run.sh) | [eval/video_depth/launch.py](eval/video_depth/launch.py) and `eval/video_depth/eval_depth.py --align scale`             |
 
 
 Common flags: `--model_name causalvggt --base_model stream3r --mode stac`. Eval scripts default to `--voxel_backend cuda` and `--allocator segment`.
 
 ## Key arguments
 
-The arguments below are used by the evaluation and inference pipeline. **Not every script exposes all of them:** `eval/long_recon/launch.py` supports the full set; `eval/cam_pose/launch.py` and `eval/video_depth/launch.py` support a subset (model, mode, streaming, window/chunk/hh/retrieval, voxel_backend, size, etc.). For programmatic use, see `model_wrapper.run_model()` and the `stac` / `stream_session` APIs.
+The arguments below are used by the evaluation and inference pipeline. `eval/long_recon/launch.py` exposes the full set, while `eval/cam_pose/launch.py` and `eval/video_depth/launch.py` expose a subset of the same interface. For programmatic use, see `model_wrapper.run_model()` and the `stac` / `stream_session` APIs.
 
-**Command line arguments (eval scripts)**
+If you want to evaluate a model with the provided launch scripts, start from the following pattern:
 
-#### --model_name
+```shell
+# 3D reconstruction
+python eval/long_recon/launch.py \
+  --dataset_type NRGBD \
+  --model_name causalvggt --base_model stream3r \
+  --mode stac --streaming
 
-  Model variant, `causalvggt` by default.
+# Camera pose
+python eval/cam_pose/launch.py \
+  --dataset_type tum \
+  --model_name causalvggt --base_model stream3r \
+  --mode stac --streaming
+```
 
-#### --base_model
+The recommended preset is `--model_name causalvggt --base_model stream3r --mode stac`. Eval scripts default to `--voxel_backend cuda` and `--allocator segment`.
 
-  Backbone: `stream3r` or `streamvggt`.
+<details>
+<summary>Command Line Arguments for [eval/long_recon/launch.py](eval/long_recon/launch.py)</summary>
 
-#### --mode
-
+- `--model_name`
+  Model variant. Default: `causalvggt`.
+- `--base_model`
+  Backbone to wrap: `stream3r` or `streamvggt`.
+- `--mode`
   Attention mode; see [Attention modes](#attention-modes). Default: `stac` (recommended preset).
-
-#### --streaming
-
-  Enable frame-by-frame inference via StreamSession (off by default).
-
-#### --window_size / -win
-
+- `--streaming`
+  Enable frame-by-frame inference through `StreamSession`. Off by default.
+- `--window_size / -win`
   Sliding KV window size in frames. Default: `0`.
-
-#### --chunk_size / -ck
-
-  Frames per forward pass. Default: `1`.
-
-#### --hh_size / -hh
-
-  Heavy-hitter frames (H2O). Default: `0`.
-
-#### --retrieval_size / -ret_sz
-
-  Voxel pivots per step; `-1` = all. Default: `0`.
-
-#### --retrieve_buf / -ret_buf
-
-  Include retrieved pivots in buffer (API: `return_buf=True`). Off by default.
-
-#### --pinned
-
-  Frame indices pinned in KV cache. Default: `0`.
-
-#### --voxel_size
-
+- `--chunk_size / -ck`
+  Number of frames processed per forward pass. Default: `1`.
+- `--hh_size / -hh`
+  Number of heavy-hitter frames kept by H2O. Default: `0`.
+- `--retrieval_size / -ret_sz`
+  Number of voxel pivots retrieved per step. Use `-1` to retrieve all. Default: `0`.
+- `--retrieve_buf / -ret_buf`
+  Include retrieved pivots in the returned buffer (`return_buf=True`). Off by default.
+- `--pinned`
+  Frame indices pinned in the KV cache. Default: `0`.
+- `--voxel_size`
   Voxel grid resolution in meters. Default: `0.05`.
-
-#### --voxel_num
-
+- `--voxel_num`
   Initial voxel pool size. Default: `4096`.
-
-#### --voxel_buf_cap
-
-  Max KV entries per buffer voxel. Default: `8`.
-
-#### --voxel_piv_cap
-
-  Max KV entries per pivot voxel. Default: `4`.
-
-#### --voxel_backend
-
-  `python` or `cuda`; eval scripts default to `cuda`.
-
-#### --allocator / -alloc
-
-  `static`, `slab`, or `segment`; eval scripts default to `segment`.
-
-#### --temperature
-
+- `--voxel_buf_cap`
+  Maximum number of KV entries stored in each buffer voxel. Default: `8`.
+- `--voxel_piv_cap`
+  Maximum number of KV entries stored in each pivot voxel. Default: `4`.
+- `--voxel_backend`
+  Voxel backend implementation: `python` or `cuda`. Eval scripts default to `cuda`.
+- `--allocator / -alloc`
+  Voxel allocator backend: `static`, `slab`, or `segment`. Eval scripts default to `segment`.
+- `--temperature`
   H2O score temperature. Default: `0.9`.
-
-#### --attn_backend
-
+- `--attn_backend`
   Sparse decode attention backend: `cuda` or `triton`. Default: `cuda`.
-
-#### --subsample
-
+- `--subsample`
   Colsum subsampling ratio in `(0, 1]`. Default: `1.0`.
-
-#### --size
-
+- `--size`
   Input resolution. Default: `518`.
 
-**Env:** `VERBOSE=1` — per-frame KV stats; `MERGER_MEM_PROFILE=1` — CUDA memory fragmentation at cleanup.
+</details>
+
+<details>
+<summary>Arguments shared by eval/cam_pose/launch.py and eval/video_depth/launch.py</summary>
+
+These scripts reuse the same core STAC/Causal-VGGT interface, but usually expose only the model and streaming-related controls:
+[`eval/cam_pose/launch.py`](eval/cam_pose/launch.py) and [`eval/video_depth/launch.py`](eval/video_depth/launch.py).
+
+- Commonly exposed flags:
+  `--model_name`, `--base_model`, `--mode`, `--streaming`, `--window_size / -win`, `--chunk_size / -ck`, `--hh_size / -hh`, `--retrieval_size / -ret_sz`, `--voxel_backend`, and `--size`.
+- Notes:
+  Dataset-specific flags differ by task, so check each script's `--help` output for the exact task arguments.
+
+</details>
+
+**Env:** `VERBOSE=1` prints per-frame KV stats; `MERGER_MEM_PROFILE=1` reports CUDA memory fragmentation during cleanup.
 
 ## Architecture
 
