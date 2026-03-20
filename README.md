@@ -8,7 +8,6 @@ Table of Contents
 - [Installation](#installation)
 - [Preparation](#preparation)
 - [Quick Start](#quick-start)
-- [Demos](#demos)
 - [Evaluation](#evaluation)
 
 ---
@@ -299,14 +298,6 @@ python main.py --scene_dir /path/to/scene --base_model streamvggt --mode stac
   Voxel allocator: ```static```, ```slab```, or ```segment```. Default: ```segment```.
 </details>
 <br>
-
-
-
-## 🎬 Demos
-
-- **Gradio:** `python demo/app_stream3r.py`
-- **Viser 3D:** `python demo/demo_viser.py --scene_dir /path/to/scene`
-- **COLMAP:** `python demo/demo_colmap.py --scene_dir /path/to/scene --output_dir output/colmap`
 
 ## 📊 Evaluation
 

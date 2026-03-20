@@ -16,6 +16,8 @@ torchinfo
 
 
 # --------- evaluation --------- #
+tqdm
+rich
 roma
 open3d
 cupoch
@@ -28,24 +30,6 @@ scikit-image
 scikit-learn
 seaborn
 pyglet<2
-
-# --------- demo --------- #
-gradio==5.17.1
-viser==0.2.23
-tqdm
-rich
-socksio
-hydra-core
-omegaconf
 opencv-python
 scipy
-onnxruntime
-requests
-trimesh
 matplotlib
-pydantic==2.10.6
-# feel free to skip the dependencies below if you do not need demo_colmap.py
-pycolmap==3.10.0
-pyceres==2.3
-# git+https://github.com/jytime/LightGlue.git#egg=lightglue
-
