@@ -36,7 +36,7 @@ Feed-forward 3D models ([STream3R](https://github.com/NIRVANALAN/STream3R), [Str
 
 ![STAC overview](./assets/stac-overview.png)
 
-*Overview: STAC with Causal-VGGT (left) and runtime–memory scaling vs. baseline (right).*
+*Overview: STAC with Causal-VGGT and runtime–memory scaling.*
 
 ### Key features
 
