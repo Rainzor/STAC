@@ -76,7 +76,7 @@ STAC/
 │  CausalVGGT Adapter (causalvggt/models/vggt.py)        │
 │  ┌─────────────────────────────────────────────────┐   │
 │  │ CausalAggregator (24-layer ViT-L)               │   │
-│  │   └─ CausalAggregator (KV-cache)                │   │
+│  │   └─ SparseAttention → kv_manager (registered)  │   │
 │  │ CameraHead → extrinsic + intrinsic              │   │
 │  │ DPTHead (×2) → depth map + point map            │   │
 │  └─────────────────────────────────────────────────┘   │
