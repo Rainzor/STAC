@@ -24,7 +24,7 @@ pip install -e merger-cuda --no-build-isolation
 pip install -e attn-cuda --no-build-isolation
 ```
 
-Checkpoints go under `ckpt/{stream3r,streamvggt}/` as `model.safetensors` or `model.pt` (auto-detected by `model_wrapper`).
+Checkpoints go under `ckpt/{stream3r,streamvggt}/` as `model.safetensors`, `model.pt`, or `model.pth` (auto-detected by `model_wrapper`).
 
 ## Common Commands
 
@@ -59,23 +59,18 @@ python eval/long_recon/launch.py --attn_backend cuda ...
 
 # Optional: colsum subsampling for sparse decode
 python eval/long_recon/launch.py --attn_backend cuda --subsample 0.25 ...
-
-# Demos
-python demo/app_stream3r.py          # Gradio web UI
-python demo/demo_viser.py --scene_dir /path/to/scene  # 3D visualization
-python demo/demo_colmap.py --scene_dir /path/to/scene --output_dir output/colmap
 ```
 
 ## Architecture
 
 ### Two entry points
 
-- **`main.py`** — Minimal inference example using the `model_wrapper` API (see README).
-- **`model_wrapper.py`** — Unified `load_model(model_name, base_model)` / `run_model()` API used by evaluation scripts. Supports `model_name=causalvggt` with `StreamSession` from `stream_session.py` for streaming.
+- **`main.py`** — Minimal inference example using the `model_wrapper` API. Supports `--streaming`, `--mode`, `--base_model`, all voxel/STAC params, and `--dtype auto|fp16|bf16`.
+- **`model_wrapper.py`** — Unified `load_model(model_name, base_model)` / `run_model()` API used by evaluation scripts. Supports `model_name=causalvggt` with `StreamSession` from `stream_session.py` for streaming. Contains `STAC_DEFAULTS` dict that defines default parameter expansion when `mode="stac"`.
 
 ### Core components
 
-- **`stream_session.py`** — `StreamSession` orchestrates frame-by-frame streaming: feeds frames, manages KV cache lifecycle (append → attention → prune → retrieve), accumulates predictions
+- **`stream_session.py`** — `StreamSession` orchestrates frame-by-frame streaming: feeds frames, manages KV cache lifecycle (append → attention → prune → retrieve), accumulates predictions. Uses `rich` for live progress display. Handles two streaming modes: `window_kv`/`causal` (with `KVManager`) and `window_chunk_merge` (with `STACVoxelKV`).
 
 - **`causalvggt/`** — Backbone-agnostic CausalVGGT adapter
   - `models/vggt.py` — `CausalVGGT` model class, wraps backbone weights selected by `base_model` param
@@ -86,7 +81,7 @@ python demo/demo_colmap.py --scene_dir /path/to/scene --output_dir output/colmap
 
 - **`stac/`** — STAC KV-cache management (plug-and-play, independent of backbone)
   - `kv_manager.py` — `KVManager` base class: window-based KV cache with recent+pinned token slots, GPU/CPU buffer split
-  - `h2o.py` — `HeavyHittersKV(KVManager)`: adds H2O heavy-hitter selection using attention scores
+  - `h2o.py` — `HeavyHittersKV(KVManager)`: adds H2O heavy-hitter selection using attention scores (token-level grouping)
   - `stac_voxel.py` — `STACVoxelKV(HeavyHittersKV)`: full STAC with 3D voxel pool for evicted KV merge + pivot retrieval
   - `voxel.py` — `BinaryVoxel`, `HashVoxel` spatial indexing structures
   - `merger.py` — `VoxelKVMerger` handles KV merge into voxels with slab/segment allocators
@@ -105,10 +100,11 @@ Per-step lifecycle in streaming: `append_kv` (layer-wise) → `decode_sparse_att
 | :--- | :--- |
 | `stac` | **Recommended** preset — expands to `window_chunk_merge` + streaming + default params (win=4, ck=4, hh=2, ret_sz=2, ret_buf) |
 | `window_chunk_merge` | Chunked sliding window + voxel-based spatial KV merging (manual param tuning) |
-| `window_merge` | Window + voxel merging (no chunking) |
-| `window` / `window_kv` | Sliding window only |
-| `window_chunk` | Chunked window without merging |
-| `full` / `causal` | Full or strictly causal attention |
+| `window_kv` | Sliding window with KVManager (H2O pruning) |
+| `causal` | Causal attention (window_size = num_frames, effectively full history) |
+| `full` | Full bidirectional attention (non-streaming mask in aggregator) |
+| `window` | Sliding window mask (block.py `create_attn_mask`) |
+| `causal_full_causal` / `full_causal` / `causal_full` | Hybrid modes with full attention on specific layer ranges (layers 10-17 or 18-23) |
 
 ### Key arguments shorthand
 
@@ -116,17 +112,16 @@ Per-step lifecycle in streaming: `append_kv` (layer-wise) → `decode_sparse_att
 
 ### CUDA extension (`merger-cuda/`)
 
-Optional GPU-accelerated voxel merging. Built with `torch.utils.cpp_extension.CUDAExtension`. Enabled via `--voxel_backend cuda`. Source in `csrc/` with C++17/CUDA kernels.
+Optional GPU-accelerated voxel merging. Built with `torch.utils.cpp_extension.CUDAExtension`. Enabled via `--voxel_backend cuda`. Source in `csrc/` with C++17/CUDA kernels. Exposes `MergerWrapper` for tensor-owning stateful voxel merge operations (`insert_and_merge`, `retrieve`). Has `pyproject.toml` (build system) + `setup.py` (metadata + extension config).
 
 ### CUDA attention extension (`attn-cuda/`)
 
 Optional CUDA flash-attention extension used by STAC decode path. Exposes
-`flash_attn_bias_colsum` (forward + optional bias + optional colsum).
+`flash_attn_bias_colsum` (forward + optional vector bias + optional colsum). Bundles `third_party/cutlass/` headers (CUTLASS GEMM/CUTE tensor abstractions).
 
 - Install: `pip install -e attn-cuda --no-build-isolation`
 - Enable at runtime: `--attn_backend cuda` (default)
 - Optional colsum subsampling: `--subsample 0.25` (or other ratio in (0, 1])
-- Regression test: `python -u attn-cuda/tests/compare_cuda_triton.py`
 
 Build architecture selection in `attn-cuda/setup.py`:
 
@@ -138,14 +133,20 @@ Build architecture selection in `attn-cuda/setup.py`:
 
 ## Data layout
 
-- Input scenes: `<scene_dir>/images/*.png`
+- Input scenes: `<scene_dir>/images/*.{png,jpg,jpeg}`
 - Evaluation datasets: symlinked under `data/` (7scenes, neural_rgbd, DTU, tum, scannet, sintel, bonn, kitti)
+- Checkpoints: `ckpt/{stream3r,streamvggt}/` (gitignored)
+- Eval outputs: `eval_recon*/`, `eval_cam_results/`, `eval_depth/` (gitignored)
 - Python path: project root is in `sys.path`; imports use package names directly (e.g., `from causalvggt.models.vggt import CausalVGGT`)
+- Input resolution: 518x392 (default), 512x384, or 224x224; controlled by `--size`
 
 ## Key conventions
 
-- Batch size is always 1 (`B=1` asserted throughout KV managers)
+- Batch size is always 1 (`B=1` asserted throughout KV managers and streaming session)
 - KV cache tensors: `[L_eff, H, T, D]` where L_eff = number of managed layers, H = heads, T = tokens, D = head_dim
-- Token counts are always multiples of `token_per_frame`
+- Token counts are always multiples of `token_per_frame` (= image_patches + special_tokens)
 - Uses `torch.bfloat16` on Ampere+ GPUs, `torch.float16` otherwise
+- `torch.backends.cuda.matmul.allow_tf32 = True` in all eval scripts
+- Eval scripts cap CPU threads to 1 via `OMP_NUM_THREADS` / `MKL_NUM_THREADS` env vars
+- `rich` library used for live progress bars and stats display in streaming mode
 - Chinese comments appear in some files (kv_manager.py, stac_voxel.py, etc.)

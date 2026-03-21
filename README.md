@@ -374,21 +374,21 @@ python eval/cam_pose/launch.py \
 <summary><span style="font-weight: bold;">Command Line Arguments for eval/cam_pose/launch.py</span></summary>
 
   #### --model_name
-    Model variant. Default: `causalvggt`.
+  Model variant. Default: `causalvggt`.
   #### --base_model
-    Backbone to wrap: `stream3r` or `streamvggt`.
+  Backbone to wrap: `stream3r` or `streamvggt`.
   #### --output_dir
-    Directory to save evaluation results. Default: `eval_results/all`.
+  Directory to save evaluation results. Default: `eval_results/all`.
   #### --dataset_type
-    Dataset to evaluate. Required. Choices: `sintel`, `tum`, `scannet`.
+  Dataset to evaluate. Required. Choices: `sintel`, `tum`, `scannet`.
   #### --scene_name
-    Specific scene(s) to evaluate. Default: all scenes.
+  Specific scene(s) to evaluate. Default: all scenes.
   #### --size
-    Input resolution (long side). Choices: `224`, `512`, `518`. Default: `518`.
+  Input resolution (long side). Choices: `224`, `512`, `518`. Default: `518`.
   #### --pose_eval_stride
-    Stride for pose evaluation. Default: `1`.
+  Stride for pose evaluation. Default: `1`.
   #### --mode
-    Attention mode. Default: `stac`. Choices: `stac`, `full`, `causal`, `window_kv`, `window_chunk_merge`.
+  Attention mode. Default: `stac`. Choices: `stac`, `full`, `causal`, `window_kv`, `window_chunk_merge`.
 </details>
 <br>
 
