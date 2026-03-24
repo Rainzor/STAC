@@ -9,16 +9,14 @@ The scene directory should contain an `images/` subfolder with .png or .jpg file
 Checkpoints should be placed under ckpt/{stream3r,streamvggt}/ (see README.md).
 """
 
-import re
 import argparse
 import logging
-from pathlib import Path
+from contextlib import nullcontext
 
 import torch
-import torch.nn.functional as F
 
 from model_wrapper import load_model, run_model
-from causalvggt.utils.load_fn import load_and_preprocess_images
+from eval.utils.image import load_scene_images
 from causalvggt.utils.pose_enc import pose_encoding_to_extri_intri
 from causalvggt.utils.geometry import unproject_depth_map_to_point_map
 
@@ -37,6 +35,8 @@ def parse_args():
                         help="Backbone weights to use")
     parser.add_argument("--size", type=int, default=518, choices=[224, 512, 518],
                         help="Input resolution")
+    parser.add_argument("--kf_every", type=int, default=10,
+                        help="Sample every k frames for limited memory inference")
     parser.add_argument("--mode", type=str, default="full",
                         help="Attention mode (full, causal, window_kv, window_chunk_merge, ...)")
     parser.add_argument("--streaming", action="store_true",
@@ -62,37 +62,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_scene_images(scene_dir, size=518):
-    """Load images from scene_dir/images/ and resize to the target resolution."""
-    image_dir = Path(scene_dir) / "images"
-    exts = ("*.png", "*.jpg", "*.jpeg")
-    image_paths = []
-    for ext in exts:
-        image_paths.extend(image_dir.glob(ext))
-
-    def numerical_sort(p: Path):
-        m = re.search(r"(\d+)", p.stem)
-        return int(m.group(1)) if m else -1
-
-    image_paths = sorted(image_paths, key=numerical_sort)
-    if not image_paths:
-        raise FileNotFoundError(f"No images found in {image_dir}")
-
-    images = load_and_preprocess_images([str(p) for p in image_paths])
-
-    # resolution as (H, W) for F.interpolate; matches eval (W,H): 512->(512,384), 518->(518,336)
-    if size == 512:
-        resolution = (384, 512)
-    elif size == 518:
-        resolution = (392, 518)
-    elif size == 224:
-        resolution = (224, 224)
-    else:
-        raise ValueError(f"Unsupported size: {size}")
-    images = F.interpolate(images, size=resolution, mode="bilinear", align_corners=False)
-    return images
-
-
 def main():
     args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -102,13 +71,20 @@ def main():
     elif args.dtype == "fp16":
         dtype = torch.float16
     else:
-        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+        if device == "cuda":
+            dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+        else:
+            dtype = torch.float32
 
     # 1. Load model
     model = load_model("causalvggt", base_model=args.base_model, device=device)
 
     # 2. Load images  — (S, 3, H, W) tensor in [0, 1]
     images = load_scene_images(args.scene_dir, size=args.size).to(device)
+
+    # 3. Sample images for limited memory inference
+    images = images[::args.kf_every] if args.kf_every > 1 else images
+
     logger.info(f"Loaded {images.shape[0]} frames, shape {tuple(images.shape)}")
 
     # 3. Run inference
@@ -130,7 +106,12 @@ def main():
         "voxel_backend": args.voxel_backend,
         "allocator": args.allocator,
     }
-    with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=dtype):
+    autocast_ctx = (
+        torch.amp.autocast(device_type="cuda", dtype=dtype)
+        if device == "cuda"
+        else nullcontext()
+    )
+    with torch.no_grad(), autocast_ctx:
         predictions = run_model(
             model, images, "causalvggt",
             mode=args.mode,

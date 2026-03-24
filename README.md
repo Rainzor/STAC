@@ -32,8 +32,6 @@
 
 ---
 
-## Table of Contents
-
 - [Overview](#overview)
 - [Installation](#installation)
 - [Preparation](#preparation)
@@ -173,17 +171,22 @@ pip install -e attn-cuda --no-build-isolation
 
 ## 📦 Preparation
 
-Put checkpoints and datasets in the right place so eval and demos can find them.
+Prepare checkpoints and datasets in the following layout so the evaluation and inference scripts can find them directly.
 
-### Checkpoints 
-Place backbone weights under `ckpt/{stream3r|streamvggt}/` as `model.safetensors`, `model.pt`, or `model.pth` (auto-detected).
+### Download Links
+
+[![Hugging Face Weights](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model%20Weights-orange)](https://huggingface.co/yslan/STream3R)
+[![Hugging Face Dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Eval%20Datasets-blue)](https://huggingface.co/datasets/yslan/pointmap_regression_evalsets)
+
+### Checkpoints
+
+Place backbone weights under `ckpt/{stream3r|streamvggt}/` as `model.safetensors`, `model.pt`, or `model.pth` (auto-detected by `model_wrapper.py`).
 
 
 | Backbone   | Hugging Face                                                      |
 | ---------- | ----------------------------------------------------------------- |
 | STream3R   | [yslan/STream3R](https://huggingface.co/yslan/STream3R) (default) |
 | StreamVGGT | [lch01/StreamVGGT](https://huggingface.co/lch01/StreamVGGT)       |
-
 
 ```bash
 # Download at least one backbone (run from repo root)
@@ -193,9 +196,14 @@ mkdir -p ckpt/stream3r && hf download yslan/STream3R --local-dir ckpt/stream3r
 ```
 
 ### Datasets
-Put scenes under `data/` with layout `data/<dataset>/<scene>/images/*.png` (e.g. `data/7scenes/chess/images/`). Supported: `7scenes`, `neural_rgbd`, `DTU`, `tum`, `scannet`, `sintel`, `bonn`, `kitti`. Preprocessing follows [CUT3R](https://github.com/CUT3R/CUT3R/blob/main/docs/preprocess.md). Pre-processed eval sets: [Hugging Face](https://huggingface.co/datasets/yslan/pointmap_regression_evalsets).
+
+Put scenes under `data/` with layout `data/<dataset>/<scene>/images/*.png`, for example `data/7scenes/chess/images/`.
+
+- Supported datasets: `7scenes`, `neural_rgbd`, `DTU`, `tum`, `scannet`, `sintel`, `bonn`, `kitti`, preprocessing follows [CUT3R](https://github.com/CUT3R/CUT3R/blob/main/docs/preprocess.md)
+- Ready-to-use evaluation sets are available on [🤗 Hugging Face datasets](https://huggingface.co/datasets/yslan/pointmap_regression_evalsets)
 
 **Suggested layout:**
+
 ```text
 STAC/                          # run all commands from repo root
 ├── ckpt/
@@ -210,7 +218,13 @@ STAC/                          # run all commands from repo root
 └── eval_depth/                 # depth output
 ```
 
-**To run:** ensure at least one backbone in `ckpt/` and a scene with an `images/` subfolder (png/jpg); run from `STAC/`.
+### Checklist
+
+Before running the project, make sure:
+
+- At least one backbone checkpoint exists under `ckpt/`
+- Your input scene or evaluation dataset contains an `images/` subfolder
+- You run commands from the repository root `STAC/`
 
 ## 🚀 Quick Start
 
@@ -221,18 +235,17 @@ Run from repo root. Example script:
 ```python
 import torch
 from pathlib import Path
-from eval.utils.image import load_images_for_eval as load_images
-from causalvggt.utils.helper import ImgNorm2Unit as ImgDust3r2Stream3r
+from eval.utils.image import load_scene_images
 from model_wrapper import load_model, run_model
 
-device = "cuda"
-scene_dir = Path("data/7scenes/chess")  # should contain images/*.png or *.jpg
+device = "cuda" if torch.cuda.is_available() else "cpu"
+scene_dir = Path("data/NRGBD/whiteroom")  # should contain images/*.png or *.jpg
 
 # Use the same resize/crop pipeline as eval launch scripts.
-size = 518
-loaded = load_images(str(scene_dir / "images"), size=size, verbose=False)
-images = torch.cat([x["img"] for x in loaded], dim=0)   # DUSt3R range [-1, 1]
-images = ImgDust3r2Stream3r(images).to(device)          # convert to [0, 1]
+images = load_scene_images(scene_dir, size=518).to(device)
+
+# Sample every 10 frames for limited memory inference
+images = images[::10]
 
 # Pick any supported backbone: "stream3r" or "streamvggt"
 model = load_model("causalvggt", base_model="stream3r", device=device)

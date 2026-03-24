@@ -5,6 +5,8 @@
 # modified from DUSt3R
 
 import os
+import re
+from pathlib import Path
 import torch
 import numpy as np
 import PIL.Image
@@ -199,6 +201,40 @@ def load_images_for_eval(
     if verbose:
         print(f" (Found {len(imgs)} images)")
     return imgs
+
+
+def load_scene_images(scene_dir, size=518, verbose=False):
+    """Load a scene folder with eval preprocessing and return images in [0, 1].
+
+    Expected layout:
+        scene_dir/
+          images/
+            *.png|*.jpg|*.jpeg
+
+    The image files are sorted by the first integer in the stem so video frames
+    like 1, 2, 10 are loaded in temporal order.
+    """
+    image_dir = Path(scene_dir) / "images"
+    if not image_dir.is_dir():
+        raise FileNotFoundError(f"Expected images directory at {image_dir}")
+
+    image_paths = []
+    for ext in ("*.png", "*.jpg", "*.jpeg"):
+        image_paths.extend(image_dir.glob(ext))
+
+    def numerical_sort(path):
+        stem = os.path.splitext(os.path.basename(str(path)))[0]
+        match = re.search(r"(\d+)", stem)
+        return int(match.group(1)) if match else -1
+
+    image_paths = sorted(image_paths, key=numerical_sort)
+    if not image_paths:
+        raise FileNotFoundError(f"No images found in {image_dir}")
+
+    loaded = load_images_for_eval([str(p) for p in image_paths], size=size, verbose=verbose)
+    images = torch.cat([item["img"] for item in loaded], dim=0)  # DUSt3R range [-1, 1]
+    images = (images + 1.0) / 2.0
+    return images
 
 
 def load_images_512(folder_or_list, size, square_ok=False, verbose=True):
