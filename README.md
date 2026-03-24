@@ -239,13 +239,12 @@ from eval.utils.image import load_scene_images
 from model_wrapper import load_model, run_model
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-scene_dir = Path("data/NRGBD/whiteroom")  # should contain images/*.png or *.jpg
+dtype = torch.bfloat16 if device == "cuda" and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+
+scene_dir = Path("data/neural_rgbd/whiteroom")  # should contain images/*.png or *.jpg
 
 # Use the same resize/crop pipeline as eval launch scripts.
-images = load_scene_images(scene_dir, size=518).to(device)
-
-# Sample every 10 frames for limited memory inference
-images = images[::10]
+images = load_scene_images(scene_dir, size=518)[::10]
 
 # Pick any supported backbone: "stream3r" or "streamvggt"
 model = load_model("causalvggt", base_model="stream3r", device=device)
@@ -253,7 +252,17 @@ model = load_model("causalvggt", base_model="stream3r", device=device)
 # model = load_model("causalvggt", base_model="stream3r", device=device, model_path="/path/to/model.pth")
 
 # mode="stac" auto-enables streaming + recommended STAC params
-predictions = run_model(model, images, "causalvggt", mode="stac")
+with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=dtype):
+    predictions = run_model(
+        model=model,
+        images=images,
+        model_name="causalvggt",
+        mode="stac",
+        streaming=True,
+        dtype=dtype,
+        device=device,
+        pinned=[0],  # required by streaming STAC path
+    )
 # predictions keys: extrinsic, intrinsic, depth, depth_conf,
 #                   world_points, world_points_conf, timing, merger, ...
 ```

@@ -37,8 +37,8 @@ def parse_args():
                         help="Input resolution")
     parser.add_argument("--kf_every", type=int, default=10,
                         help="Sample every k frames for limited memory inference")
-    parser.add_argument("--mode", type=str, default="full",
-                        help="Attention mode (full, causal, window_kv, window_chunk_merge, ...)")
+    parser.add_argument("--mode", type=str, default="stac",
+                        help="Attention mode (stac, full, causal, window_kv, window_chunk_merge, ...)")
     parser.add_argument("--streaming", action="store_true",
                         help="Enable frame-by-frame streaming via StreamSession")
     parser.add_argument("--window_size", "-win", type=int, default=0)
@@ -47,7 +47,7 @@ def parse_args():
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "fp16", "bf16"])
     parser.add_argument("--attn_backend", type=str, default="cuda", choices=["cuda", "triton"])
     parser.add_argument("--subsample", type=float, default=1.0)
-    parser.add_argument("--pinned", type=int, default=0, nargs="+")
+    parser.add_argument("--pinned", type=int, default=[0], nargs="+")
     parser.add_argument("--temperature", type=float, default=0.9)
     parser.add_argument("--retrieval_size", "-ret_sz", type=int, default=0)
     parser.add_argument("--retrieve_buf", "-ret_buf", action="store_true")
