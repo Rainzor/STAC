@@ -279,11 +279,11 @@ model = load_model("causalvggt", base_model="streamvggt", device=device)
 `main.py` provides a minimal inference example on a scene folder. Scene dirs need an `images/` subfolder with `.png` or `.jpg` files. Eval scripts (see [Evaluation](#evaluation)) add dataset loading and metrics on top of the same interface.
 
 ```shell
-# Minimal run (full attention, no streaming)
+# Minimal run (default mode is STAC)
 python main.py --scene_dir /path/to/scene
 
-# STAC preset (recommended)
-python main.py --scene_dir /path/to/scene --mode stac
+# Full attention baseline (no streaming)
+python main.py --scene_dir /path/to/scene --mode full
 
 # Explicit STAC configuration (equivalent to --mode stac)
 python main.py --scene_dir /path/to/scene \
@@ -306,10 +306,12 @@ python main.py --scene_dir /path/to/scene --base_model streamvggt --mode stac
   Backbone weights to use: ```stream3r``` or ```streamvggt```. Default: ```stream3r```.
   #### --size
   Input resolution. Choices: ```224```, ```512```, ```518```. Default: ```518```.
+  #### --kf_every
+  Sample every k frames for limited memory inference. Default: ```10```.
   #### --mode
-  Attention mode (```full```, ```causal```, ```stac```, ```window_kv```, ```window_chunk_merge```, ...). Default: ```full```.
+  Attention mode (```stac```, ```full```, ```causal```, ```window_kv```, ```window_chunk_merge```, ...). Default: ```stac```.
   #### --streaming
-  Enable frame-by-frame streaming via ```StreamSession```. Off by default.
+  Enable frame-by-frame streaming via ```StreamSession```. Off by default (auto-enabled by ```--mode stac```).
   #### --dtype
   Autocast dtype: ```auto```, ```fp16```, or ```bf16```. ```auto``` selects ```bf16``` on Ampere+ GPUs, otherwise ```fp16```. Default: ```auto```.
   #### --window_size / -win
@@ -323,7 +325,7 @@ python main.py --scene_dir /path/to/scene --base_model streamvggt --mode stac
   #### --retrieve_buf / -ret_buf
   Include retrieved pivots in the returned buffer. Off by default.
   #### --pinned
-  Frame indices pinned in the KV cache. Default: ```0```.
+  Frame indices pinned in the KV cache. Default: ```[0]```.
   #### --temperature
   H2O score temperature. Default: ```0.9```.
   #### --attn_backend
