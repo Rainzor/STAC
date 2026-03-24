@@ -1,8 +1,38 @@
-# STAC: Sparse Token Attention Cache for Streaming 3D Reconstruction
+<div align="center">
+<h1>STAC: Plug-and-Play Spatio-Temporal Aware Cache Compression for Streaming 3D Reconstruction</h1>
 
-**STAC** is a **plug-and-play** KV-cache module for memory-efficient streaming 3D reconstruction over long videos. It compresses evicted KV-cache tokens into a 3D voxel pool and retrieves them on demand — compatible with any causal vision transformer backbone.
+<a href="https://arxiv.org/pdf/2603.20284" target="_blank" rel="noopener noreferrer">
+  <img src="https://img.shields.io/badge/Paper-STAC-red" alt="Paper PDF">
+</a>
+<a href="https://arxiv.org/abs/2603.20284">
+  <img src="https://img.shields.io/badge/arXiv-2603.20284-b31b1b" alt="arXiv">
+</a>
+<a href="https://stac-3r.github.io/">
+  <img src="https://img.shields.io/badge/Project_Page-green" alt="Project Page">
+</a>
+<a href="https://github.com/Rainzor/STAC">
+  <img src="https://img.shields.io/badge/Code-GitHub-black" alt="Code">
+</a>
 
-Table of Contents
+**[University of Science and Technology of China](https://en.ustc.edu.cn/)**
+
+[Runze Wang](https://rainzor.github.io/), Yuxuan Song, Youcheng Cai, [Ligang Liu](http://staff.ustc.edu.cn/~lgliu/)
+
+
+</div>
+
+```bibtex
+@article{wang2026stac,
+  title={STAC: Plug-and-Play Spatio-Temporal Aware Cache Compression for Streaming 3D Reconstruction},
+  author={Wang, Runze and Song, Yuxuan and Cai, Youcheng and Liu, Ligang},
+  journal={arXiv preprint arXiv:2603.20284},
+  year={2026}
+}
+```
+
+---
+
+## Table of Contents
 
 - [Overview](#overview)
 - [Installation](#installation)
@@ -10,39 +40,33 @@ Table of Contents
 - [Quick Start](#quick-start)
 - [Evaluation](#evaluation)
 
----
+## 📖 Overview
+
+**STAC** is a **plug-and-play** KV-cache compression framework for memory-efficient streaming 3D reconstruction over long videos. It compresses evicted KV-cache tokens into a spatio-temporal voxel memory and retrieves relevant pivots on demand, enabling bounded-memory long-range spatial reasoning.
+
+
+Feed-forward 3D models such as [STream3R](https://github.com/NIRVANALAN/STream3R) and [StreamVGGT](https://github.com/wzzheng/StreamVGGT) scale poorly on long videos due to $O(N)$ attention memory. Sliding-window attention avoids OOM but loses long-range context. **STAC** keeps memory bounded while restoring long-range spatial recall by merging evicted KV tokens into a 3D voxel memory and retrieving the most relevant pivots during streaming.
 
 
 | Capability         | Full Attention | Causal / Window   | **STAC (Ours)**           |
 | ------------------ | -------------- | ----------------- | ------------------------- |
 | Attention          | All frames     | Sliding window    | Window + voxel retrieval  |
-| Memory scaling     | O(N²)          | O(W) fixed window | O(W) + bounded voxel pool |
+| Memory scaling     | $O(N)$         | $O(W)$ fixed window | $O(W)$ + bounded voxel pool |
 | Long-video support | ✗ (OOM)        | ✓ (no history)    | ✓ (with spatial memory)   |
-
-
-
-
-![Attention pattern](assets/attention-pattern.png)
-
-*Attention pattern: Window (local only) vs. STAC (selective long-range retrieval with bounded cache).*
-
-**Supported backbones** (switch via `--base_model`): [STream3R](https://github.com/NIRVANALAN/STream3R) (`stream3r`) · [StreamVGGT](https://github.com/wzzheng/StreamVGGT) (`streamvggt`)
-
-## 📖 Overview
-
-Feed-forward 3D models ([STream3R](https://github.com/NIRVANALAN/STream3R), [StreamVGGT](https://github.com/wzzheng/StreamVGGT)) scale poorly on long videos (O(N²) memory); sliding-window attention avoids OOM but loses history. **STAC** merges evicted tokens into a 3D voxel pool by world coordinates and retrieves the most relevant *pivot* tokens at each step, keeping long-range spatial memory with bounded memory and compute.
-
-
 
 ![STAC overview](./assets/stac-overview.png)
 
-*Overview: STAC with Causal-VGGT and runtime–memory scaling.*
+*Overview: STAC with Causal-VGGT and runtime-memory scaling.*
 
-### Key features
 
-- **Plug-and-play** — switch backbones via `--base_model`; no code changes.
-- **Memory-constrained** — working temporal cache + long-term voxel merge keep KV growth bounded over long streams.
-- **Efficient inference** — chunk-based StreamSession and optional CUDA (merger + attn) for stable latency and higher throughput.
+
+**Supported backbones** (switch via `--base_model`): [STream3R](https://github.com/NIRVANALAN/STream3R) (`stream3r`) and [StreamVGGT](https://github.com/wzzheng/StreamVGGT) (`streamvggt`).
+
+### Key Features
+
+- **Plug-and-play**: Switch backbones via `--base_model` with no code changes.
+- **Memory-constrained**: Temporal cache + voxel memory keeps KV growth bounded on long streams.
+- **Efficient inference**: Chunk-based `StreamSession` with optional CUDA backends for stable latency and higher throughput.
 
 ### Code Structure
 
@@ -55,7 +79,7 @@ STAC/
 ├── stac/                      # STAC KV-cache compression (plug-and-play)
 │   ├── kv_manager.py          #   Sliding window + H2O token selection
 │   ├── h2o.py                 #   Heavy-hitter scoring
-│   ├── stac_voxel.py          #   Voxel pool: evict → merge → retrieve
+│   ├── stac_voxel.py          #   Voxel pool: evict -> merge -> retrieve
 │   ├── merger.py              #   Token merging operations
 │   ├── voxel.py               #   Voxel grid utilities
 │   ├── allocator.py           #   Static / slab / segment allocators
@@ -65,6 +89,8 @@ STAC/
 └── merger-cuda/               # Custom CUDA merger kernel
 ```
 
+### Pipeline Diagram
+
 ```text
 ┌────────────────────────────────────────────────────────┐
 │  Backbone (interchangeable)                            │
@@ -73,22 +99,22 @@ STAC/
 │  └──────┬──────┘ └──────┬──────┘ └────────┬────────┘   │
 │         └───────────────┼─────────────────┘            │
 │                         ▼                              │
-│  CausalVGGT Adapter (causalvggt/models/vggt.py)        │
+│  CausalVGGT Adapter (vggt.py)                          │
 │  ┌─────────────────────────────────────────────────┐   │
 │  │ CausalAggregator (24-layer ViT-L)               │   │
-│  │   └─ SparseAttention → kv_manager (registered)  │   │
-│  │ CameraHead → extrinsic + intrinsic              │   │
-│  │ DPTHead (×2) → depth map + point map            │   │
+│  │   └─ SparseAttention -> kv_manager (registered) │   │
+│  │ CameraHead -> extrinsic + intrinsic             │   │
+│  │ DPTHead (x2) -> depth map + point map           │   │
 │  └─────────────────────────────────────────────────┘   │
 └─────────────────────────────┬──────────────────────────┘
                               │ KV pairs
                               ▼
 ┌─────────────────────────────────────────────────────────┐
-│  STAC KV-Cache (stac/)  ← plug-and-play                 │
+│  STAC KV-Cache (stac/)  <- plug-and-play                │
 │  ┌───────────────────────────────────────────────────┐  │
 │  │ KVManager   sliding window (recent + pinned)      │  │
 │  │ ├ H2O       heavy-hitter selection                │  │
-│  │ └ STACVoxel 3D voxel pool: evict→merge→retrieve   │  │
+│  │ └ STACVoxel 3D voxel pool: evict->merge->retrieve │  │
 │  └───────────────────────────────────────────────────┘  │
 └─────────────────────────────┬───────────────────────────┘
                               │
