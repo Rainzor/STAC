@@ -218,14 +218,6 @@ STAC/                          # run all commands from repo root
 └── eval_depth/                 # depth output
 ```
 
-### Checklist
-
-Before running the project, make sure:
-
-- At least one backbone checkpoint exists under `ckpt/`
-- Your input scene or evaluation dataset contains an `images/` subfolder
-- You run commands from the repository root `STAC/`
-
 ## 🚀 Quick Start
 
 ### Python API
