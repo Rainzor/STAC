@@ -46,7 +46,7 @@
 Feed-forward 3D models such as [STream3R](https://github.com/NIRVANALAN/STream3R) and [StreamVGGT](https://github.com/wzzheng/StreamVGGT) scale poorly on long videos due to $O(N)$ attention memory. Sliding-window attention avoids OOM but loses long-range context. **STAC** keeps memory bounded while restoring long-range spatial recall by merging evicted KV tokens into a 3D voxel memory and retrieving the most relevant pivots during streaming.
 
 
-| Capability         | Full Attention | Causal / Window   | **STAC (Ours)**           |
+| Capability         | Causal         |  Window           | **STAC (Ours)**           |
 | ------------------ | -------------- | ----------------- | ------------------------- |
 | Attention          | All frames     | Sliding window    | Window + voxel retrieval  |
 | Memory scaling     | $O(N)$         | $O(W)$ fixed window | $O(W)$ + bounded voxel pool |
