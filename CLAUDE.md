@@ -80,6 +80,13 @@ Batch scripts: `eval/long_recon/run.sh`, `eval/cam_pose/run.sh`, `eval/video_dep
 
 **`causalvggt/layers/attention.py` — `SparseAttention`** — Attention layer that hooks into the `KVManager`. When `kv_manager` is set, calls `append_kv()` then `decode_sparse_attn()` instead of standard SDPA.
 
+**KV-cache class hierarchy (each extends the one above):**
+
+```text
+KVManager  →  HeavyHittersKV  →  STACVoxelKV
+(sliding window)  (H2O scoring)  (voxel long-term store)
+```
+
 **`stac/kv_manager.py` — `KVManager`** — Sliding window KV cache. Stores recent + pinned frames in a pre-allocated GPU tensor `[L, H, T_buffer, D]`. Prunes by keeping `recent_size` frames + pinned frame indices. Supports CPU offload for overflow.
 
 **`stac/h2o.py` — `HeavyHittersKV`** — Extends `KVManager` with Heavy-Hitter Oracle (H2O) scoring. Prunes by keeping `recent_size` + top-`hh_size` scored frames + pinned frames.
