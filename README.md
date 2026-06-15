@@ -1,9 +1,7 @@
 <div align="center">
 <h1>STAC: Plug-and-Play Spatio-Temporal Aware Cache Compression for Streaming 3D Reconstruction</h1>
 
-<a href="https://openaccess.thecvf.com/content/CVPR2026/html/Wang_STAC_Plug-and-Play_Spatio-Temporal_Aware_Cache_Compression_for_Streaming_3D_Reconstruction_CVPR_2026_paper.html" target="_blank" rel="noopener noreferrer">
-  <img src="https://img.shields.io/badge/Paper-STAC-red" alt="Paper PDF">
-</a>
+<a href="https://openaccess.thecvf.com/content/CVPR2026/html/Wang_STAC_Plug-and-Play_Spatio-Temporal_Aware_Cache_Compression_for_Streaming_3D_Reconstruction_CVPR_2026_paper.html"><img src="https://img.shields.io/badge/Paper-STAC-red" alt="Paper PDF"></a>
 <a href="https://arxiv.org/abs/2603.20284">
   <img src="https://img.shields.io/badge/arXiv-2603.20284-b31b1b" alt="arXiv">
 </a>
